@@ -1,0 +1,62 @@
+# OGC 2026 — The Grand Shipyard Puzzle (작업 지침서)
+
+이 문서는 여러 데스크탑에서 작업을 이어가기 위한 프로젝트 지침서입니다. 새 세션/새 머신에서 시작할 때 이 파일을 먼저 읽고 규칙과 현재 상태를 파악하세요.
+
+## 1. 문제 개요
+조선소 블록 공간 스케줄링 문제. 각 블록을 **어느 bay에, 어디에·어떤 방향으로, 언제 넣고(ENTRY)·언제 빼는가(EXIT)** 를 동시에 결정한다.
+- 블록: 불규칙(non-convex 가능) 폴리곤 레이어 K개로 된 3D 구조, orientation 여러 개, 부동소수 좌표(4자리). 참조점 = 첫 레이어 첫 정점 = (0,0), 나머지 정점은 상대좌표. `(x,y)`는 참조점을 옮기는 정수 좌표(서버가 반올림).
+- 제약: (1) 배정(모든 블록 정확히 1 bay, ENTRY 1·EXIT 1, **한 번 놓으면 이동·회전 불가**), (2) 시간(ENTRY≥release, EXIT−ENTRY≥processing; 처리 후에도 다른 블록에 막히면 더 머물 수 있음), (3) 공간(같은 레이어끼리 내부 겹침 없음), (4) **크레인**(수직 이동 시 j≥k 규칙: 넣거나 뺄 블록의 레이어 l1이 같은/더 높은 레이어 l2를 가진 다른 블록과 겹치면 불가 → 오버행 아래 깔린 블록은 위 블록이 있는 동안 못 움직임). 각 시점에서 EXIT를 ENTRY보다 먼저.
+- 목적(최소화): `w1·Z1 + w2·Z2 + w3·Z3`. Z1=총 tardiness Σmax(0,EXIT−Due), Z2=bay 간 정규화 워크로드 불균형 max, Z3=선호도 페널티 Σ(Smax−Sij). weights는 인스턴스마다 크게 다름.
+- 상세: `문제 정의.pdf` (v1.2). 애매하면 이 PDF가 최종 근거.
+
+## 2. 절대 규칙 (반드시 준수)
+1. **`utils.py`는 절대 수정 금지.** 서버가 제출본을 덮어쓰고, 이 파일의 `check_feasibility`로 채점한다. 검증·헬퍼로 **임포트만** 한다.
+2. **엔트리 포인트는 `baseline/myalgorithm.py`의 `algorithm(prob_info, timelimit=60)`.** 시그니처 변경 금지. 우리 로직은 **전부 `myalgorithm.py` 안**에 둔다(단일 파일 방침). 제출본은 `myalgorithm.py + utils.py`만으로 동작. 검증된 소형 헬퍼는 utils에서 임포트하거나 인라인. (큰 헬퍼가 필요해지면 `baseline_greedy.py`에서 임포트 가능하나, 가급적 자체 포함 유지.)
+3. **feasibility 최우선.** 리더보드는 infeasible/시간초과/크래시를 모두 **−1점**, feasible을 **R−nb(≥1)** 로 매긴다. 따라서 항상 "보장된 feasible 해"를 들고 가고 **절대 −1을 받지 않는다.** 최종 반환 해는 반드시 `utils.check_feasibility`로 통과 확인.
+4. **시간예산 준수.** 서버 시간제한은 인스턴스마다 다르고(수분~30분) 사후 공개. dev 머신이 서버보다 느릴 수 있으니 **모든 시간 로직은 timelimit의 비율**로(절대상수 금지) + 안전마진(현재 90%).
+5. **오버피팅 금지.** 연습문제 40개의 우연한 분포(bay 2~5개, 블록 100~300개 등)에 맞추지 말 것. 파라미터는 인스턴스 특성으로 스케일링. 서버 hidden 인스턴스는 다를 수 있다.
+
+## 3. 리포지토리 구조
+- `baseline/` — **제출 폴더**(이 안에서 작업). `myalgorithm.py`(엔트리 + 우리 로직 전부; `Solver` 클래스 + `Placement` dataclass), `baseline_greedy.py`(참조 구현·헬퍼 출처), `utils.py`(채점기, 수정금지).
+- `alg_tester/` — PyQt6 GUI 테스터(`alg_tester_app.py`), 시각화. `example/` 예제 인스턴스. `ogc2026_env.yml` conda 파일.
+- `연습문제 1/train/prob_1..20.json`, `연습문제 2/train/prob_21..40.json` — 학습 인스턴스.
+- `문제 정의.pdf` — 공식 문제 정의.
+
+## 4. 실행 방법
+conda 환경 `ogc2026`(Miniforge)에서 실행. 파이썬은 항상 이 환경으로.
+- **GUI 테스터**: `conda activate ogc2026` → `cd alg_tester` → `python alg_tester_app.py` → 인스턴스 선택 → 알고리즘 폴더(`baseline/`) 선택 → 시간제한 설정 후 Run.
+- **CLI 단일 실행**: `baseline/`에서 `python -c "import json,myalgorithm; ... "` 또는 헬퍼 스크립트.
+- **전체 40개 빠른 평가**(feasibility+objective 표): 프로파일링/스모크 스크립트는 세션 scratchpad에 둔다(리포지토리 오염 방지). 핵심 패턴:
+  ```python
+  import myalgorithm; from utils import check_feasibility
+  sol = myalgorithm.algorithm(prob_info, timelimit)
+  res = check_feasibility(prob_info, sol)   # res["feasible"], res["objective"], obj1/2/3
+  ```
+- 환경 python 경로는 머신마다 다르다(예: Windows `...\.conda\envs\ogc2026\python.exe`). 하드코딩하지 말고 각 머신에서 확인.
+
+## 5. 현재 상태 (진행 로그)
+- **프로파일링 완료(baseline, prob_1~40, TL=30s)**: baseline은 **9/40만 feasible**, 나머지는 시간제한을 최대 수십 배 초과하고도 INFEASIBLE. 실패의 **97%가 크레인(stage 2 ENTRY 74% + stage 3 EXIT 23%)**, 공간충돌(stage 4)로 실패한 인스턴스는 **0개**. → 병목은 면적이 아니라 **크레인 통로 접근**. 목적함수는 이중 구조(타이트=tardiness 지배, 느슨=선호도 지배).
+- **Layer 0 구현 완료(`myalgorithm.py`의 `Solver.build_floor`)**: **serial-per-bay** 보장된-feasible 생성기 + anytime 시간가드. 각 블록을 맞는 bay에 EDD 순서로 넣되 **한 bay에 동시에 최대 1블록**만 두어(N(t,j)≤1) 크레인·충돌을 구성적으로 만족(크레인 제약을 능동 체크한 게 아니라 회피한 것). 결과: **40/40 feasible, 각 <0.1초.** baseline의 31개 −1을 전부 양수로 전환. 코드는 가벼운 OO(`Solver`+`Placement`)로 작성.
+- **Layer 1 구현 완료(`Solver.build_coexist`)**: 크레인-인지 coexistence 구성. **핵심 수정 = 양방향 크레인 검사**: baseline `_find_earliest_slot`은 "기존 블록이 새 블록을 막는가"만 검사하고 **"새 블록이 기존 블록의 (체류 중) 진입·반출을 막는가"를 누락** — 이것이 baseline stage-2/3 실패(97%)의 구조적 원인. Layer 1은 배치 시점에 pairwise 양방향 검사(`check_entry`를 술어로 사용; ENTRY/EXIT 술어 동일, j≥k가 j=k를 포함하므로 **stage-4 충돌검사는 크레인 검사에 포함되어 생략**). 같은-시각 경계는 양방향 보수 검사. bbox-conflict 오름차순 후보 정렬(0-conflict → shapely 없이 즉시 배치), 위치 그리드 xs/ys 각 30개 캡, per-block 시간예산(하드) + empty-window 폴백, `CONSTRUCT_SAFETY=0.72` 시간분할. 결과(TL=30s): **40/40 feasible + Layer1 40/40 채택**. baseline 대비: baseline이 풀던 9개 중 6개에서 1.3~68배 개선. 연습문제 2 세트는 21.6s 구성예산 포화 → 폴백 다수, tardiness 잔존(속도 개선 + 서버의 더 긴 TL에서 완화).
+- **Layer 2 구현 완료(`Solver.lns_improve`)**: 국면 적응 LNS. (1) **결정론적 tardiness 스윕**: 개선가능 offender(피할 수 없는 min_tard=r+proc-due 초과분)마다 [offender + 그 이른-윈도우를 점유한 bbox-겹침 블로커 ≤3개] 제거 → offender-우선 재삽입 → 개선 시만 유지, 최대 3패스. (2) **확률 destroy-repair 루프**: 지배 항 룰렛(w1·개선가능tardiness / w2·obj2 / w3·obj3 + 15% random), tardy 이웃은 offender ≤2(큰 이웃은 재삽입 연쇄붕괴로 항상 기각됨 — 진단으로 확인), balance/pref는 thorough 재삽입(모든 bay 정확 비교) + 5% 점수노이즈, sideways 20% 수락. 목적함수는 utils와 동일 산술(obj2 floor 포함)로 정확 추적 → 루프 내 check_feasibility 불필요, 최종 1회만 공식 검증. `LNS_SAFETY=0.82`. 전체 벤치마크(TL=30s): **40/40 feasible, 최슬로 24.7s(규율 준수)**. 구성이 안정적인 세트 1에서 뚜렷한 개선(prob_4 +34.5%, prob_7 +31%, prob_1 +24.6%, prob_10 +19.9%), baseline 대비 우위 유지(prob_2 69.7x, prob_11 16.9x, prob_10 14.2x). **단, 세트 2 + prob_20은 run별 편차가 지배**(아래 참고).
+- **Layer 3 구현 완료(Gurobi 분해 부분문제, 2026-07-17)**: 두 MILP + 헤지 파이프라인. **(3b) bay별 타이밍 MILP(`milp_refine_times`)**: 배치 고정 시 obj2·obj3는 시간과 무관(utils가 workload 상수 합산)하므로 entry/exit 재최적화는 obj1만 움직임 → bay별 독립 MILP(쌍별 크레인 충돌 플래그 사전계산, Layer-1과 동일한 보수 경계 규칙의 big-M disjunction, warm start). **결과 = 증명된 발견: 연습 인스턴스에서 구성/LNS의 타이밍은 배치 고정 시 이미 최적**(status=2, bound=incumbent) — 남은 이득은 블록 이동에서만 나옴(리포트 가치). 파이프라인 끝에 보험용으로 유지. **(3a) bay 배정 마스터(`milp_reassign`)**: z[i,j] 배정 MILP — obj3 선형 정확, obj2 epigraph 정확(floor 단조) → 배정 수준 obj2+obj3 최적을 정확히 풂(측정: prob_8 23112→11252, prob_4 98k→16k 헤드룸). 실현 3경로: ① **constrained rebuild**(배정을 `only_bay`로 고정해 Layer-1 전체 재구성; 창이 L1 구성비용의 1.3배 이상일 때) — 약속된 obj2/obj3를 거의 정확히 실현하나 꼬리 tardiness 수 단위 잔존, ② rebuild가 즉시 개선이면 수락, 아니면 **잠재력 게이트**(w1·min_tard합 + rebuild의 obj2/obj3 < incumbent) 통과 시 **투기 분기**로 보존, ③ **스텝별 실현**(이동 1개=1스텝, 착지 실패 시 창-블로커 동반제거 강화 스텝, best-prefix까지 역순 undo) — 확실 이득만 수락. **헤지**: 투기 분기는 LNS 창의 절반만 시험 → 중간에 incumbent 추월 시 계속(이어달리기는 새 시드 0x5EED — 같은 시드 재시작은 소진된 제안 반복으로 0 accepted), 아니면 incumbent로 복귀(손실 = LNS 절반로 유계). 결과(TL=30): **prob_4 207695→109443(baseline 대비 1.64x 역전)**, prob_8 21948(마스터가 0.3초에 확실 이득; LNS 24초 정체분을 대체), prob_1 89338 보존.
+- **⚠️ 시간예산 교훈(중요)**: `_place_coexist`의 예산 체크를 "최소 1개 후보 평가 보장"으로 완화했다가 **set-2에서 wall 3400s 폭주**(혼잡 bay에서 후보 1개 평가가 수 초 → 폴백이 쌓일수록 스케줄이 길어져 더 느려지는 악순환). → **모든 예산 체크는 하드**(incumbent 없어도 중단→폴백), `_earliest_slot` 시각 루프 내부에도 시간 탈출. 예산이 그리드 구축 비용(~30ms)보다 커야 유효 탐색이 됨(LNS 재삽입 예산 0.5s 캡).
+
+## 6. 로드맵 (레이어 계획)
+- **Layer 0 ✅** feasibility floor + 시간가드.
+- **Layer 1 ✅** 크레인-인지 coexistence(양방향 크레인 검사로 baseline의 실패 모드 제거).
+- **Layer 2 ✅** LNS(tardiness 스윕 + 국면 적응 destroy-repair).
+- **Layer 3 ✅** Gurobi 분해 부분문제: (3a) bay 배정 마스터 MILP + constrained rebuild/스텝별 실현 + 투기 분기 헤지, (3b) bay별 타이밍 MILP(증명: 배치 고정 시 타이밍 이미 최적). gurobipy 없거나 라이선스 없으면 자동 no-op(서버는 주최측 라이선스).
+- **다음 (속도)** 연습문제 2 세트는 구성 자체가 21.6s 예산 포화(TL=30 기준) → LNS 시간이 3초뿐. `_place_coexist`/`_earliest_slot` 프로파일링 후 STRtree 또는 numba 커널로 가속 → 같은 TL에서 더 많은 탐색+LNS. 서버 TL(수분~30분)에서는 자연 완화되지만 속도는 그대로 이득.
+- **다음 (품질/안정성)** ① **구성 분산 문제(측정됨)**: 예산 포화 인스턴스(세트 2, prob_20)는 wall-clock 예산이 타이밍에 민감해 run별 목적값이 최대 8배 출렁임(prob_20: 805k~6.8M). LNS는 자기 run의 L1보다 절대 나빠지지 않지만 시작점이 흔들림. 해결 = 속도 개선(예산이 안 묶이게) + 결정론적 예산(평가 횟수 기반) 검토. ② prob_8류 obj2-지배에서 balance op 정체 — bay 쌍 교환(swap) 연산자 검토. ③ 남는 시간 활용: 작은 인스턴스는 구성 재시작(다른 순서)로 최고 시작점 선택 검토.
+- **Gurobi(라이선스 확보 완료 — 이 노트북에서 정상 작동 확인 2026-07-16: ACADEMIC, 만료 2027-07-16, gurobipy 13.0.2로 3000변수 MILP 해결. 단 node-locked이므로 다른 데스크탑은 별도 발급 필요)** monolithic 금지, **분해된 부분문제**에만: 배치 고정 후 entry/exit 시간·시퀀싱 MILP, 또는 bay 배정 마스터(set-partitioning/컬럼 생성). 서버는 주최측 라이선스 제공.
+- **Layer 3(선택, 리포트 가치)** RL/GNN은 hard-constraint 취약성 때문에 보조(순서·가지치기)로만, exact checker로 감쌈.
+
+## 7. 속도 전략
+1차: shapely 2.x **STRtree 공간인덱스**로 (시간겹침 ∧ 공간근접) 쌍만 추림 + 증분/캐싱. 부족하면 그 정밀검사 커널만 **numpy 좌표배열 기반 numba/cython**으로. 단 non-convex라 SAT 불가 → 일반 폴리곤 교차 필요. **최종 검증은 반드시 원본 `check_feasibility`**, 내부 고속 체커는 보수적으로(애매하면 exact 승격).
+
+## 8. 서버/환경 제약 (§3.2 of PDF)
+AMD Threadripper PRO 9955WX, Ubuntu 24.04, **≤4 CPU 코어(400%)**, ≤16GB RAM, **인터넷 없음**, 상위 디렉토리 접근 불가(상대경로만). firejail+cpulimit. bay는 독립 크레인 → **bay별 병렬화 가능**. 사용 가능 패키지: python 3.12, numba 0.61, cython 3.0.10, ortools 9.15, gurobipy 13.0.2, xpress 9.8.1, torch/tensorflow(CPU only, **GPU 없음**), shapely 2.1.2 등. 제출 zip ≤15MB, `myalgorithm.py`는 루트에, 추가 파일은 상대경로.
+
+## 9. 심사 (§3.3, §5)
+예선 자동채점(점수 = Σ 인스턴스 점수) → 상위 30~40팀 본선. 본선은 자동채점 + **기술 리포트 + 발표**. "성능에 완전히 반영 안 돼도 새로운 아이디어·이론적 기여를 높이 산다" → 원리적 방법(크레인 오버행-nesting 형식화, 솔버 분해 등)에 투자하면 리포트 점수로 회수.
