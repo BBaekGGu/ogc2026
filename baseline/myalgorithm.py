@@ -719,6 +719,10 @@ class Solver:
     # (roulette over w1*obj1 / w2*obj2 / w3*obj3, plus a random share):
     #   tardy   -- worst-tardiness blocks, plus one block "squatting" on each
     #              one's earlier time window (bbox-overlapping in its bay)
+    #   timewin -- whole-time-window repack: EVERY block of an offender's bay
+    #              whose stay intersects the offender's window, re-sequenced in
+    #              a randomised order (tardiness on congested instances is
+    #              sequencing-bound -- single moves are zero-sum shifts)
     #   pref    -- blocks placed outside their most-preferred bay
     #   balance -- random blocks from the most (normalized-)loaded bay
     #   random  -- uniform random blocks
@@ -728,7 +732,8 @@ class Solver:
                     deadline: float | None = None,
                     seed: int = 0xC0FFEE,
                     stall_frac: float | None = None,
-                    do_sweep: bool = True) -> tuple[list[Placement], int, int]:
+                    do_sweep: bool = True,
+                    temp: float = 0.0) -> tuple[list[Placement], int, int]:
         """Improve `placements` until `deadline` (default LNS_SAFETY *
         timelimit).  `seed` keeps runs reproducible; callers resuming a state
         that already consumed the default stream pass a different one so the
@@ -741,6 +746,15 @@ class Solver:
         resuming a branch whose sweep already ran to exhaustion pass this (a
         sweep pass costs tens of seconds on congested instances and is
         near-deterministic, so replaying it on an unchanged branch is waste).
+        `temp > 0` enables simulated-annealing acceptance: a worsening delta
+        is accepted with probability exp(-delta / T), where T = temp * (running
+        mean of the positive deltas seen so far) * (fraction of this call's
+        window remaining) -- self-scaling across instances (no absolute
+        constants) and cooling to pure descent by the deadline.  Used by the
+        round driver against sequencing-bound tardiness (prob_23 class), where
+        greedy descent has NO improving neighbourhood and only a temporarily
+        worse re-sequencing can unlock progress.  The best placements SEEN are
+        returned, never the (possibly worse) final SA state.
         Returns (improved placements, accepted iterations, total iterations)."""
         if deadline is None:
             deadline = self.t_start + self.timelimit * LNS_SAFETY
@@ -848,6 +862,27 @@ class Solver:
                             extra.append(rec.bid)
                             n_taken += 1
                 return sel + extra
+            if op == "timewin":
+                # Whole-time-window repack: on congested instances tardiness
+                # is sequencing-bound (pulling one block forward pushes
+                # another -- zero-sum), so remove EVERY block of the
+                # offender's bay whose stay intersects the offender's window
+                # and let the repair re-sequence them together.
+                cands = [(cur[bi].exit_time - self.blocks[bi]["due_date"] - min_tard_of[bi], bi)
+                         for bi in cur
+                         if cur[bi].exit_time - self.blocks[bi]["due_date"] > min_tard_of[bi]]
+                if not cands:
+                    return select("random", k)
+                cands.sort(reverse=True)
+                _, off = cands[rng.randrange(min(3, len(cands)))]
+                p_off = cur[off]
+                r_off = self.blocks[off]["release_time"]
+                members = [rec.bid for rec in state[p_off.bay_id]
+                           if rec.exit > r_off and rec.entry < p_off.exit_time]
+                if len(members) > 10:  # keep the offender (distance 0) + nearest stays
+                    members.sort(key=lambda bi: abs(cur[bi].entry_time - p_off.entry_time))
+                    members = members[:10]
+                return members
             if op == "pref":
                 cands = []
                 for bi in cur:
@@ -928,6 +963,10 @@ class Solver:
 
         # -- stochastic destroy-repair loop -----------------------------------
         last_progress = time.time()  # sweep improvements count as progress
+        window = max(deadline - t_call, 1e-9)
+        best_loc_obj = cur_obj                 # best placements SEEN so far
+        best_pl = list(cur.values())           # snapshot: SA may wander below it
+        d_hist: list[float] = []               # recent positive deltas (SA scale)
         while time.time() < deadline:
             if stall_window is not None and time.time() - last_progress > stall_window:
                 break  # plateaued: hand the remaining window back to the caller
@@ -942,6 +981,8 @@ class Solver:
             else:
                 x = rng.random() * tot
                 op = "tardy" if x < T else ("balance" if x < T + B else "pref")
+            if op == "tardy" and rng.random() < 0.25:
+                op = "timewin"  # sequencing move instead of single-offender move
 
             # Small neighbourhoods iterate fast; occasionally go large.
             k = rng.randint(2, 6) if rng.random() < 0.7 else rng.randint(2, k_max)
@@ -967,6 +1008,13 @@ class Solver:
                 order = sorted(victims, key=lambda i: (-old_imp_tard[i],
                                                        self.blocks[i]["due_date"],
                                                        self.blocks[i]["processing_time"]))
+            elif op == "timewin":
+                # The whole point is a DIFFERENT sequence: noisy-EDD over the
+                # removed set so ties and near-ties reshuffle every draw.
+                dues = {i: self.blocks[i]["due_date"] for i in victims}
+                span = float(max(dues.values()) - min(dues.values())) or 1.0
+                order = sorted(victims,
+                               key=lambda i: dues[i] + rng.uniform(-0.4, 0.4) * span)
             else:
                 order = sorted(victims, key=lambda i: (self.blocks[i]["due_date"],
                                                        self.blocks[i]["processing_time"]))
@@ -986,23 +1034,47 @@ class Solver:
                 added.append(bi)
 
             new_obj, n1, n2, n3 = exact_terms()
-            # Accept improvements; also walk sideways occasionally (equal
-            # objective, different configuration) to escape plateaus -- the
-            # objective can never increase.
-            if new_obj < cur_obj or (new_obj == cur_obj and rng.random() < 0.2):
-                if new_obj < cur_obj:
+            d = new_obj - cur_obj
+            # Accept improvements; walk sideways occasionally (equal objective,
+            # different configuration); with temp > 0 also accept worsenings
+            # with the Metropolis probability -- the returned solution is the
+            # BEST seen, so the caller never receives worse than its input.
+            accept = d < 0 or (d == 0 and rng.random() < 0.2)
+            if not accept and temp > 0.0 and d > 0:
+                d_hist.append(d)
+                if len(d_hist) > 64:
+                    d_hist.pop(0)
+                # MEDIAN delta as the temperature scale: the delta distribution
+                # is heavy-tailed (one wrecked reinsertion can cost 100x the
+                # typical move), and a mean-scaled T degenerates into a random
+                # walk.  The median keeps huge worsenings near-impossible while
+                # typical ones pass at the intended Metropolis rate.
+                med = sorted(d_hist)[len(d_hist) // 2]
+                frac = max(0.0, (deadline - time.time()) / window)  # cooling
+                T_abs = temp * med * frac
+                accept = T_abs > 0 and rng.random() < math.exp(-d / T_abs)
+            if accept:
+                if d < 0:
                     n_acc += 1
-                    last_progress = time.time()
                 cur_obj, o1, o2, o3 = new_obj, n1, n2, n3
+                if cur_obj < best_loc_obj:
+                    best_loc_obj = cur_obj
+                    best_pl = list(cur.values())
+                    last_progress = time.time()
             else:  # revert to the exact previous state (same _Rec objects)
                 for bi in added:
                     remove(bi)
                 for p, rec in saved:
                     restore(p, rec)
 
-        print(f"[ogc] Layer2 LNS    : {n_iter} iters, {n_acc} accepted, "
-              f"exact obj {start_obj:.0f} -> {cur_obj:.0f}  elapsed={self.elapsed():.2f}s")
-        return list(cur.values()), n_acc, n_iter
+        if best_loc_obj < cur_obj:
+            out, out_obj = best_pl, best_loc_obj  # SA wandered: return the best seen
+        else:
+            out, out_obj = list(cur.values()), cur_obj
+        tag = f", SA temp={temp:.2f}" if temp > 0 else ""
+        print(f"[ogc] Layer2 LNS    : {n_iter} iters, {n_acc} accepted{tag}, "
+              f"exact obj {start_obj:.0f} -> {out_obj:.0f}  elapsed={self.elapsed():.2f}s")
+        return out, n_acc, n_iter
 
     # ======================================================================
     # Layer 3: Gurobi timing MILP (decomposed subproblem)
@@ -1593,16 +1665,25 @@ class Solver:
                 round_i = 0
                 n_hopeless = 0  # consecutive restarts far off the incumbent
                 sweep_next = True  # sweep only fresh branches, not replays
+                stall_n = 0  # consecutive rounds without strict improvement
                 while time.time() < lns_deadline - margin:
+                    # Temperature ladder: descent first; after each stalled
+                    # round escalate the SA temperature so sequencing-bound
+                    # tardiness (zero-sum shifts with no improving neighbour)
+                    # can pass through temporarily worse re-sequencings.
                     pl, _, n_it = self.lns_improve(
                         cur, deadline=lns_deadline,
                         seed=base_seed + 7919 * round_i, stall_frac=0.25,
-                        do_sweep=sweep_next)
+                        do_sweep=sweep_next,
+                        temp=(0.0, 0.5, 1.0, 1.5)[min(stall_n, 3)])
                     sweep_next = False
                     round_i += 1
                     o = self._exact_obj(pl)
                     if o < cur_ox:
                         progressed = True
+                        stall_n = 0
+                    else:
+                        stall_n += 1
                     cur, cur_ox = pl, o  # a round never returns worse than its input
                     if n_it == 0:
                         break  # nothing left to iterate on
@@ -1612,10 +1693,17 @@ class Solver:
                     # Plateaued with time to spare: perturbed restart if the
                     # window affords a construction (measured Layer-1 cost).
                     est = getattr(self, "_l1_secs", None)
-                    if est is not None and n_hopeless < 2 and \
+                    if est is not None and n_hopeless < 3 and \
                             remaining > 1.6 * est + margin:
+                        # Budget floor RELATIVE to the timelimit: candidate
+                        # quality is wildly non-monotone in the budget when it
+                        # sits barely above the per-block minimum (measured on
+                        # prob_8: same seed gives 12412 or 2.0M depending on
+                        # jitter), and two unlucky draws used to disable
+                        # restarts for good.
                         cand = self.build_coexist(
-                            deadline=time.time() + min(remaining * 0.5, 1.5 * est),
+                            deadline=time.time() + min(remaining * 0.5,
+                                                       max(1.5 * est, 0.03 * self.timelimit)),
                             order_rng=random.Random(0xA11CE + round_i),
                             order_noise=(0.08, 0.25, 0.6)[round_i % 3])
                         co = self._exact_obj(cand)
@@ -1623,6 +1711,7 @@ class Solver:
                             cur, cur_ox = cand, co
                             progressed = True
                             n_hopeless = 0
+                            stall_n = 0
                             sweep_next = True  # fresh branch: sweep it once
                             print(f"[ogc] Layer2 restart: perturbed construction adopted "
                                   f"(exact obj {co:.0f})  elapsed={self.elapsed():.2f}s")
