@@ -46,8 +46,10 @@ import math
 import random
 from dataclasses import dataclass
 
-from utils import (Bay, Block, check_entry, check_feasibility,
-                   _resolve_layers, _bounding_box)
+import shapely
+
+from utils import (Bay, Block, check_feasibility,
+                   _resolve_layers, _bounding_box, _poly_from_verts)
 
 
 # Fraction of the wall-clock limit we allow ourselves to use overall.  Below
@@ -96,6 +98,7 @@ class _Rec:
     bid: int
     block: object          # utils.Block (world-coordinate layers cached)
     bbox: tuple            # world bbox (x0, y0, x1, y1)
+    geo: list | None = None  # lazy fast-predicate geometry (see Solver._rec_geo)
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +163,7 @@ class Solver:
         self.w3 = w.get("w3", 1.0)
 
         self._bbox_cache: dict = {}
+        self._geo_cache: dict = {}  # (id(block_data), orient) -> (local layers, local layer bboxes)
         self.best_sol: dict | None = None  # always feasible once the floor is built
 
     # -- time ----------------------------------------------------------------
@@ -177,6 +181,95 @@ class Solver:
             v = _block_bbox(block_data, orient_idx)
             self._bbox_cache[key] = v
         return v
+
+    # -- fast crane predicate (search-only mirror of utils.check_entry) ------
+    #
+    # utils.check_entry is pure geometry (no time dependence): mover layer k
+    # obstructed by existing layer j >= k iff their polygons intersect with
+    # area > 0.  The official checker still validates every accepted solution;
+    # this mirror only replaces check_entry inside the SEARCH hot path, with
+    # identical decisions but (a) per-layer bbox prefilters (pure arithmetic),
+    # (b) shapely prepared-geometry `intersects` gates, and (c) polygons built
+    # once per committed block / candidate instead of per call.
+    # The bay-containment branch of check_entry is dropped deliberately: every
+    # candidate position is generated inside [px_lo, px_hi] x [py_lo, py_hi],
+    # so footprints are inside the bay by construction (it never fired).
+
+    _UNBUILT = object()  # sentinel: polygon not constructed yet (None = degenerate)
+
+    def _local_geo(self, block_data: dict, orient_idx: int):
+        """(local layer vertex lists, local layer bboxes), reference point at
+        the origin -- world coordinates are local + (x, y), exactly as
+        utils.Block.__post_init__ translates them."""
+        key = (id(block_data), orient_idx)
+        g = self._geo_cache.get(key)
+        if g is None:
+            layers = _resolve_layers(block_data["shape"][orient_idx]["layers"])
+            if layers:
+                rx, ry = layers[0][0] if layers[0] else (0.0, 0.0)
+                layers = [[(vx - rx, vy - ry) for vx, vy in l] for l in layers]
+            bboxes = [_bounding_box(l) for l in layers]
+            g = (layers, bboxes)
+            self._geo_cache[key] = g
+        return g
+
+    def _make_geo(self, block_data: dict, orient_idx: int, x: float, y: float) -> list:
+        """Geometry bundle [world bboxes, lazy polys, local layers, x, y] for
+        one placed shape.  Polygons are built (and prepared) on first use."""
+        loc, lb = self._local_geo(block_data, orient_idx)
+        wb = [(b0 + x, b1 + y, b2 + x, b3 + y) for b0, b1, b2, b3 in lb]
+        return [wb, [Solver._UNBUILT] * len(loc), loc, x, y]
+
+    def _rec_geo(self, rec: _Rec) -> list:
+        g = getattr(rec, "geo", None)
+        if g is None:
+            g = self._make_geo(self.blocks[rec.bid], rec.block.orient_idx,
+                               rec.block.x, rec.block.y)
+            rec.geo = g
+        return g
+
+    @staticmethod
+    def _geo_poly(geo: list, i: int):
+        p = geo[1][i]
+        if p is Solver._UNBUILT:
+            _, _, loc, x, y = geo
+            p = _poly_from_verts([[vx + x, vy + y] for vx, vy in loc[i]])
+            if p is not None:
+                shapely.prepare(p)
+            geo[1][i] = p
+        return p
+
+    @staticmethod
+    def _sweep_blocked(mover_geo: list, exist_geo: list) -> bool:
+        """True iff the mover's vertical sweep is obstructed by `exist`:
+        exists (k, j), j >= k, with area(mover layer k  ∩  exist layer j) > 0.
+        Decision-identical to utils.check_entry conditions 2 & 3."""
+        m_wb = mover_geo[0]
+        e_wb = exist_geo[0]
+        n_e = len(e_wb)
+        for k in range(len(m_wb)):
+            mk = m_wb[k]
+            mp = Solver._UNBUILT
+            for j in range(k, n_e):
+                ej = e_wb[j]
+                if mk[2] <= ej[0] or ej[2] <= mk[0] or mk[3] <= ej[1] or ej[3] <= mk[1]:
+                    continue  # layer bboxes disjoint -> polygons disjoint
+                if mp is Solver._UNBUILT:
+                    mp = Solver._geo_poly(mover_geo, k)
+                if mp is None:
+                    break  # degenerate mover layer obstructs nothing
+                ep = Solver._geo_poly(exist_geo, j)
+                if ep is None:
+                    continue
+                if not shapely.intersects(mp, ep):
+                    continue  # prepared-geometry gate (cheap)
+                # For polygonal geometry area(A ∩ B) > 0  <=>  the interiors
+                # meet (an open non-empty 2D set has positive area), i.e.
+                # intersects AND NOT touches -- both prepared-accelerated,
+                # ~50x cheaper than materialising the intersection.
+                if not shapely.touches(mp, ep):
+                    return True
+        return False
 
     def _fit_position(self, block_data: dict, bay: Bay) -> tuple[int, int, int] | None:
         """First orientation with a valid integer reference-point position in
@@ -435,7 +528,7 @@ class Solver:
                     if time.time() > t_deadline:
                         return self._as_placement(bi, best)  # hard budget: commit incumbent (may be None)
                     bound = best[0] if best is not None else None
-                    slot = self._earliest_slot(bi, bd, oi, bb, x, y, bay, recs,
+                    slot = self._earliest_slot(bd, oi, bb, x, y, recs,
                                                exit_ts, r, proc, due, pref_pen, bound,
                                                t_deadline)
                     if slot is None:
@@ -467,8 +560,8 @@ class Solver:
         _, bay_id, x, y, oi, entry, exit_t = best
         return Placement(bi, bay_id, int(x), int(y), oi, int(entry), int(exit_t))
 
-    def _earliest_slot(self, bid: int, bd: dict, oi: int, bb, x: int, y: int,
-                       bay: Bay, recs: list[_Rec], exit_ts: list[int],
+    def _earliest_slot(self, bd: dict, oi: int, bb, x: int, y: int,
+                       recs: list[_Rec], exit_ts: list[int],
                        r: int, proc: int, due: int, pref_pen: float,
                        score_bound: float | None,
                        t_deadline: float = float("inf")) -> tuple[int, int] | None:
@@ -493,9 +586,33 @@ class Solver:
         if not conf:
             return r, r + proc
 
-        n_blk = None  # constructed lazily, only if a shapely check is needed
+        # The crane predicate is pure geometry -- independent of t -- so each
+        # (candidate, committed block) pair is evaluated at most once and the
+        # time loop below is pure arithmetic over the cached flags.
+        # (Batching all pairs into vectorised shapely calls was tried and is
+        # SLOWER here: array conversion costs ~140us per call, which loses to
+        # lazy per-pair calls at the ~10 pairs a candidate typically has.)
+        cand_geo = None  # built lazily: many candidates die on the first t
+        flags: dict[int, tuple[bool, bool]] = {}
+
+        def pair_flags(rec: _Rec) -> tuple[bool, bool]:
+            fl = flags.get(rec.bid)
+            if fl is None:
+                nonlocal cand_geo
+                if cand_geo is None:
+                    cand_geo = self._make_geo(bd, oi, x, y)
+                rg = self._rec_geo(rec)
+                fl = (self._sweep_blocked(cand_geo, rg),   # rec obstructs OUR sweep
+                      self._sweep_blocked(rg, cand_geo))   # we obstruct THEIRS
+                flags[rec.bid] = fl
+            return fl
+
         w1, w3 = self.w1, self.w3
         for t in [r] + exit_ts:
+            # HARD time escape (see the budget lesson in CLAUDE.md): a crowded
+            # bay can make even one candidate expensive, and overruns compound.
+            if time.time() > t_deadline:
+                return None
             # Later entries only increase tardiness: once even the tardiness
             # term alone is no better than the incumbent, stop.
             if score_bound is not None and \
@@ -508,16 +625,14 @@ class Solver:
                 e = rec.exit
                 if e <= t or a >= et:
                     continue  # no temporal interaction (EXIT-before-ENTRY makes boundaries safe)
-                if n_blk is None:
-                    n_blk = Block(block_id=bid, block_data=bd, x=x, y=y, orient_idx=oi)
                 # OUR crane moments: rec present at our entry/exit sweep.
                 if (a < t < e) or a == t or (a < et < e) or e == et:
-                    if check_entry(bay, [rec.block], n_blk, fast=True):
+                    if pair_flags(rec)[0]:
                         ok = False
                         break
                 # THEIR crane moments: we are present at rec's entry/exit sweep.
                 if (t < a < et) or a == t or (t < e < et) or e == et:
-                    if check_entry(bay, [n_blk], rec.block, fast=True):
+                    if pair_flags(rec)[1]:
                         ok = False
                         break
             if ok:
@@ -1227,33 +1342,31 @@ class Solver:
         ({block_id: (entry, exit)}, tardiness gain) on strict improvement,
         None otherwise (including timeouts and oversized models)."""
         GRB = gp.GRB
-        bay = self.bays[bay_id]
         n = len(ps)
         if n <= 1:
             return None
 
-        # World bboxes + Block objects for the pairwise conflict flags.
+        # World bboxes + fast-predicate geometry for the pairwise conflict flags.
         recs = []
         for p in ps:
             bd = self.blocks[p.block_id]
-            blk = Block(block_id=p.block_id, block_data=bd,
-                        x=p.x, y=p.y, orient_idx=p.orient_idx)
+            geo = self._make_geo(bd, p.orient_idx, p.x, p.y)
             lx0, ly0, lx1, ly1 = self._bbox(bd, p.orient_idx)
-            recs.append((p, bd, blk, (p.x + lx0, p.y + ly0, p.x + lx1, p.y + ly1)))
+            recs.append((p, bd, geo, (p.x + lx0, p.y + ly0, p.x + lx1, p.y + ly1)))
 
         conf: list[tuple[int, int]] = []  # (mover, static): mover blocked while static present
         for i in range(n):
             if time.time() > t_deadline:
                 return None  # hard budget: pair precompute is shapely-bound
-            _, _, blk_i, bb_i = recs[i]
+            _, _, geo_i, bb_i = recs[i]
             for j in range(i + 1, n):
-                _, _, blk_j, bb_j = recs[j]
+                _, _, geo_j, bb_j = recs[j]
                 if (bb_i[2] <= bb_j[0] or bb_j[2] <= bb_i[0] or
                         bb_i[3] <= bb_j[1] or bb_j[3] <= bb_i[1]):
                     continue
-                if check_entry(bay, [blk_j], blk_i, fast=True):
+                if self._sweep_blocked(geo_i, geo_j):
                     conf.append((i, j))
-                if check_entry(bay, [blk_i], blk_j, fast=True):
+                if self._sweep_blocked(geo_j, geo_i):
                     conf.append((j, i))
 
         if 2 * len(conf) > 30000:
