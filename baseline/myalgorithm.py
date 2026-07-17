@@ -382,10 +382,17 @@ class Solver:
     # completes before CONSTRUCT_SAFETY * timelimit.
 
     def build_coexist(self, bay_of: dict[int, int] | None = None,
-                      deadline: float | None = None) -> list[Placement]:
+                      deadline: float | None = None,
+                      order_rng: random.Random | None = None,
+                      order_noise: float = 0.08) -> list[Placement]:
         """Coexistence construction.  With `bay_of` (block_id -> bay) the
         search is restricted to the given bay per block, so a Layer-3 master
         assignment can be realised by a full rebuild instead of local patches.
+        With `order_rng` the EDD insertion order is perturbed by
+        +-`order_noise` of the due-date span -- used by the restart rounds to
+        escape the greedy construction's own quality ceiling on congested
+        instances (the driver cycles the magnitude: gentle nudges first, then
+        aggressive reshuffles).
         """
         if deadline is None:
             deadline = self.t_start + self.timelimit * CONSTRUCT_SAFETY
@@ -396,10 +403,19 @@ class Solver:
 
         state: list[list[_Rec]] = [[] for _ in range(n_bays)]
         loads = [0.0] * n_bays
-        order = sorted(
-            range(len(self.blocks)),
-            key=lambda i: (self.blocks[i]["due_date"], self.blocks[i]["processing_time"]),
-        )
+        if order_rng is None:
+            order = sorted(
+                range(len(self.blocks)),
+                key=lambda i: (self.blocks[i]["due_date"], self.blocks[i]["processing_time"]),
+            )
+        else:
+            dues = [b["due_date"] for b in self.blocks]
+            span = float(max(dues) - min(dues)) or 1.0
+            noisy = {i: self.blocks[i]["due_date"]
+                     + order_rng.uniform(-order_noise, order_noise) * span
+                     for i in range(len(self.blocks))}
+            order = sorted(range(len(self.blocks)),
+                           key=lambda i: (noisy[i], self.blocks[i]["processing_time"]))
 
         placements: list[Placement] = []
         n_fallback = 0
@@ -417,7 +433,7 @@ class Solver:
             self._commit(p, state, loads)
             placements.append(p)
 
-        if n_fallback and bay_of is None:
+        if n_fallback and bay_of is None and order_rng is None:
             print(f"[ogc]   Layer1: {n_fallback} fallback placement(s)")
         return placements
 
@@ -710,14 +726,28 @@ class Solver:
 
     def lns_improve(self, placements: list[Placement],
                     deadline: float | None = None,
-                    seed: int = 0xC0FFEE) -> tuple[list[Placement], int, int]:
+                    seed: int = 0xC0FFEE,
+                    stall_frac: float | None = None,
+                    do_sweep: bool = True) -> tuple[list[Placement], int, int]:
         """Improve `placements` until `deadline` (default LNS_SAFETY *
         timelimit).  `seed` keeps runs reproducible; callers resuming a state
         that already consumed the default stream pass a different one so the
         roulette does not replay proposals that were already exhausted.
+        With `stall_frac`, return early once no STRICT improvement has been
+        found for that fraction of this call's window -- the caller can then
+        spend the freed time on construction restarts or a fresh seed instead
+        of replaying a plateaued search to the deadline.
+        `do_sweep=False` skips the deterministic tardiness sweep -- callers
+        resuming a branch whose sweep already ran to exhaustion pass this (a
+        sweep pass costs tens of seconds on congested instances and is
+        near-deterministic, so replaying it on an unchanged branch is waste).
         Returns (improved placements, accepted iterations, total iterations)."""
         if deadline is None:
             deadline = self.t_start + self.timelimit * LNS_SAFETY
+        t_call = time.time()
+        stall_window = None
+        if stall_frac is not None:
+            stall_window = max(stall_frac * (deadline - t_call), 0.02 * self.timelimit)
         n = len(self.blocks)
         n_bays = len(self.bays)
         if time.time() >= deadline or n == 0 or not placements:
@@ -849,7 +879,7 @@ class Solver:
         # repairs accept reliably, while large random neighbourhoods do not --
         # so harvest them deterministically and leave only the rarer
         # multi-block rearrangements to the stochastic loop below.
-        for _ in range(3):
+        for _ in range(3 if do_sweep else 0):
             improved_any = False
             offenders = sorted(
                 ((max(0, cur[bi].exit_time - self.blocks[bi]["due_date"]) - min_tard_of[bi], bi)
@@ -897,7 +927,10 @@ class Solver:
                 break
 
         # -- stochastic destroy-repair loop -----------------------------------
+        last_progress = time.time()  # sweep improvements count as progress
         while time.time() < deadline:
+            if stall_window is not None and time.time() - last_progress > stall_window:
+                break  # plateaued: hand the remaining window back to the caller
             n_iter += 1
             # regime roulette: attack the currently dominant IMPROVABLE term
             T = self.w1 * max(0.0, o1 - total_min_tard)
@@ -959,6 +992,7 @@ class Solver:
             if new_obj < cur_obj or (new_obj == cur_obj and rng.random() < 0.2):
                 if new_obj < cur_obj:
                     n_acc += 1
+                    last_progress = time.time()
                 cur_obj, o1, o2, o3 = new_obj, n1, n2, n3
             else:  # revert to the exact previous state (same _Rec objects)
                 for bi in added:
@@ -1507,26 +1541,98 @@ class Solver:
             if spec is not None and self.time_left() > 0:
                 lns_deadline = self.t_start + self.timelimit * LNS_SAFETY
                 mid = time.time() + 0.5 * (lns_deadline - time.time())
-                if mid > time.time():
-                    spec_pl, _, _ = self.lns_improve(spec, deadline=mid)
-                    if self._exact_obj(spec_pl) < best_obj:
-                        lns_input = spec_pl
-                        spec_adopted = True
-                        print(f"[ogc] Layer2 spec   : rebuild branch overtook the incumbent "
-                              f"-- continuing on it")
-                    else:
-                        print(f"[ogc] Layer2 spec   : rebuild branch did not overtake "
-                              f"-- back to the incumbent")
+                # The trial runs in three segments with a linear-extrapolation
+                # abort: if the measured recovery rate cannot close the gap to
+                # the incumbent within the trial window, stop gambling NOW and
+                # give the time back to the incumbent branch (measured on
+                # prob_23/26: the trial otherwise burns its full half-window
+                # on an arithmetically hopeless chase).  Overtaking ends the
+                # trial early in the winning direction instead.
+                spec_pl = spec
+                for si in range(3):
+                    now = time.time()
+                    if now >= mid:
+                        break
+                    seg_deadline = now + (mid - now) / (3 - si)
+                    o_before = self._exact_obj(spec_pl)
+                    spec_pl, _, _ = self.lns_improve(
+                        spec_pl, deadline=seg_deadline,
+                        seed=0xC0FFEE + 7919 * si, stall_frac=0.25)
+                    o_after = self._exact_obj(spec_pl)
+                    if o_after < best_obj:
+                        break  # overtaken -- no need to finish the trial
+                    rate = (o_before - o_after) / max(time.time() - now, 1e-9)
+                    if rate * (mid - time.time()) < o_after - best_obj:
+                        break  # projected miss -- abort the gamble
+                if self._exact_obj(spec_pl) < best_obj:
+                    lns_input = spec_pl
+                    spec_adopted = True
+                    print(f"[ogc] Layer2 spec   : rebuild branch overtook the incumbent "
+                          f"-- continuing on it")
+                else:
+                    print(f"[ogc] Layer2 spec   : rebuild branch did not overtake "
+                          f"-- back to the incumbent")
         except Exception as exc:  # defensive: incumbent survives the gamble
             print(f"[ogc] Layer2 spec failed ({exc!r}) -- back to the incumbent")
 
         try:
             if self.time_left() > 0:
-                # A fresh seed when resuming the adopted spec branch: its
-                # default stream was consumed by the trial half above.
-                lns_placements, n_acc, _ = self.lns_improve(
-                    lns_input, seed=0x5EED if spec_adopted else 0xC0FFEE)
-                if n_acc > 0 or spec_adopted:
+                # Round loop: each LNS round returns early once it plateaus
+                # (stall_frac); the freed window funds perturbed-order
+                # construction RESTARTS (adopted only when strictly better by
+                # the exact objective) and fresh-seed LNS rounds.  This
+                # attacks the two measured stall modes at once: the greedy
+                # construction's own quality ceiling (prob_23/26 class) and
+                # seed exhaustion in long windows (prob_4 class).
+                lns_deadline = self.t_start + self.timelimit * LNS_SAFETY
+                margin = 0.02 * self.timelimit
+                cur = lns_input
+                cur_ox = self._exact_obj(cur)
+                progressed = spec_adopted
+                base_seed = 0x5EED if spec_adopted else 0xC0FFEE
+                round_i = 0
+                n_hopeless = 0  # consecutive restarts far off the incumbent
+                sweep_next = True  # sweep only fresh branches, not replays
+                while time.time() < lns_deadline - margin:
+                    pl, _, n_it = self.lns_improve(
+                        cur, deadline=lns_deadline,
+                        seed=base_seed + 7919 * round_i, stall_frac=0.25,
+                        do_sweep=sweep_next)
+                    sweep_next = False
+                    round_i += 1
+                    o = self._exact_obj(pl)
+                    if o < cur_ox:
+                        progressed = True
+                    cur, cur_ox = pl, o  # a round never returns worse than its input
+                    if n_it == 0:
+                        break  # nothing left to iterate on
+                    remaining = lns_deadline - time.time()
+                    if remaining <= margin:
+                        break
+                    # Plateaued with time to spare: perturbed restart if the
+                    # window affords a construction (measured Layer-1 cost).
+                    est = getattr(self, "_l1_secs", None)
+                    if est is not None and n_hopeless < 2 and \
+                            remaining > 1.6 * est + margin:
+                        cand = self.build_coexist(
+                            deadline=time.time() + min(remaining * 0.5, 1.5 * est),
+                            order_rng=random.Random(0xA11CE + round_i),
+                            order_noise=(0.08, 0.25, 0.6)[round_i % 3])
+                        co = self._exact_obj(cand)
+                        if co < cur_ox:
+                            cur, cur_ox = cand, co
+                            progressed = True
+                            n_hopeless = 0
+                            sweep_next = True  # fresh branch: sweep it once
+                            print(f"[ogc] Layer2 restart: perturbed construction adopted "
+                                  f"(exact obj {co:.0f})  elapsed={self.elapsed():.2f}s")
+                        elif co > 1.3 * cur_ox:
+                            # Construction-scale quality is far off the
+                            # incumbent (e.g. after a big master gain): two
+                            # such misses in a row stop further restarts.
+                            n_hopeless += 1
+                lns_placements = cur
+                if progressed:
                     cand = {"operations": _build_operations(lns_placements)}
                     res2 = check_feasibility(self.prob, cand)
                     if res2["feasible"] and res2["objective"] < best_obj:
