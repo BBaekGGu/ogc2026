@@ -765,7 +765,9 @@ class Solver:
                     seed: int = 0xC0FFEE,
                     stall_frac: float | None = None,
                     do_sweep: bool = True,
-                    temp: float = 0.0) -> tuple[list[Placement], int, int]:
+                    temp: float = 0.0,
+                    only_bay: int | None = None,
+                    verbose: bool = True) -> tuple[list[Placement], int, int]:
         """Improve `placements` until `deadline` (default LNS_SAFETY *
         timelimit).  `seed` keeps runs reproducible; callers resuming a state
         that already consumed the default stream pass a different one so the
@@ -787,6 +789,11 @@ class Solver:
         greedy descent has NO improving neighbourhood and only a temporarily
         worse re-sequencing can unlock progress.  The best placements SEEN are
         returned, never the (possibly worse) final SA state.
+        `only_bay` pins every reinsertion to one bay and disables the cross-bay
+        operators (balance/pref); with the assignment fixed obj2/obj3 are a
+        constant offset, so accept/reject reduces to that bay's tardiness --
+        this is what the parallel per-bay workers run.  `verbose=False`
+        silences the per-round log line (used by those workers).
         Returns (improved placements, accepted iterations, total iterations)."""
         if deadline is None:
             deadline = self.t_start + self.timelimit * LNS_SAFETY
@@ -858,7 +865,10 @@ class Solver:
             bi: max(0, bd["release_time"] + bd["processing_time"] - bd["due_date"])
             for bi, bd in enumerate(self.blocks)
         }
-        total_min_tard = float(sum(min_tard_of.values()))
+        # Sum over the blocks actually present (== all blocks in the global
+        # case, one bay's blocks under only_bay) so the roulette's T term
+        # matches o1's scope in both.
+        total_min_tard = float(sum(min_tard_of[bi] for bi in cur))
 
         def select(op: str, k: int) -> list[int]:
             if op == "tardy":
@@ -974,9 +984,10 @@ class Solver:
                 added = []
                 for bi in victims:  # offender first, then its blockers
                     budget = max(0.002, min(0.5, (deadline - time.time()) / 8))
-                    p = self._place_coexist(bi, state, loads, u, time.time() + budget)
+                    p = self._place_coexist(bi, state, loads, u, time.time() + budget,
+                                            only_bay=only_bay)
                     if p is None:
-                        p = self._fallback_place(bi, state)
+                        p = self._fallback_place(bi, state, only_bay=only_bay)
                     rec_of[bi] = self._commit(p, state, loads)
                     cur[bi] = p
                     added.append(bi)
@@ -1013,6 +1024,8 @@ class Solver:
             else:
                 x = rng.random() * tot
                 op = "tardy" if x < T else ("balance" if x < T + B else "pref")
+            if only_bay is not None and op in ("balance", "pref"):
+                op = "tardy"  # cross-bay operators are no-ops pinned to one bay
             if op == "tardy" and rng.random() < 0.25:
                 op = "timewin"  # sequencing move instead of single-offender move
 
@@ -1058,9 +1071,10 @@ class Solver:
                     # one iteration may use at most ~1/4 of the remaining time
                     budget = max(0.002, min(0.5, (deadline - now) / (4 * (len(order) - j))))
                     p = self._place_coexist(bi, state, loads, u, now + budget,
-                                            thorough=thorough, rng=rng)
+                                            thorough=thorough, rng=rng,
+                                            only_bay=only_bay)
                 if p is None:
-                    p = self._fallback_place(bi, state)
+                    p = self._fallback_place(bi, state, only_bay=only_bay)
                 rec_of[bi] = self._commit(p, state, loads)
                 cur[bi] = p
                 added.append(bi)
@@ -1103,10 +1117,176 @@ class Solver:
             out, out_obj = best_pl, best_loc_obj  # SA wandered: return the best seen
         else:
             out, out_obj = list(cur.values()), cur_obj
-        tag = f", SA temp={temp:.2f}" if temp > 0 else ""
-        print(f"[ogc] Layer2 LNS    : {n_iter} iters, {n_acc} accepted{tag}, "
-              f"exact obj {start_obj:.0f} -> {out_obj:.0f}  elapsed={self.elapsed():.2f}s")
+        if verbose:
+            tag = f", SA temp={temp:.2f}" if temp > 0 else ""
+            print(f"[ogc] Layer2 LNS    : {n_iter} iters, {n_acc} accepted{tag}, "
+                  f"exact obj {start_obj:.0f} -> {out_obj:.0f}  elapsed={self.elapsed():.2f}s")
         return out, n_acc, n_iter
+
+    # -- serial round driver (factored out of solve so it can run on either a
+    #    half window before the parallel phase or the reclaimed remainder) ----
+    def _lns_rounds(self, cur: list[Placement], deadline: float,
+                    base_seed: int, spec_adopted: bool,
+                    sweep_first: bool) -> tuple[list[Placement], bool]:
+        """Run LNS rounds until `deadline`, funding perturbed-order
+        construction restarts from the freed time when a round plateaus.
+        Returns (best placements, progressed?).  A round never returns worse
+        than its input, so `cur` is monotone non-worsening."""
+        margin = 0.02 * self.timelimit
+        cur_ox = self._exact_obj(cur)
+        progressed = spec_adopted
+        round_i = 0
+        n_hopeless = 0            # consecutive restarts far off the incumbent
+        sweep_next = sweep_first  # sweep only fresh branches, not replays
+        stall_n = 0               # consecutive rounds without strict improvement
+        while time.time() < deadline - margin:
+            # Temperature ladder: descent first; after each stalled round
+            # escalate the SA temperature so sequencing-bound tardiness can
+            # pass through temporarily worse re-sequencings.
+            pl, _, n_it = self.lns_improve(
+                cur, deadline=deadline,
+                seed=base_seed + 7919 * round_i, stall_frac=0.25,
+                do_sweep=sweep_next,
+                temp=(0.0, 0.5, 1.0, 1.5)[min(stall_n, 3)])
+            sweep_next = False
+            round_i += 1
+            o = self._exact_obj(pl)
+            if o < cur_ox:
+                progressed = True
+                stall_n = 0
+            else:
+                stall_n += 1
+            cur, cur_ox = pl, o
+            if n_it == 0:
+                break  # nothing left to iterate on
+            remaining = deadline - time.time()
+            if remaining <= margin:
+                break
+            est = getattr(self, "_l1_secs", None)
+            if est is not None and n_hopeless < 3 and remaining > 1.6 * est + margin:
+                cand = self.build_coexist(
+                    deadline=time.time() + min(remaining * 0.5,
+                                               max(1.5 * est, 0.03 * self.timelimit)),
+                    order_rng=random.Random(0xA11CE + round_i),
+                    order_noise=(0.08, 0.25, 0.6)[round_i % 3])
+                co = self._exact_obj(cand)
+                if co < cur_ox:
+                    cur, cur_ox = cand, co
+                    progressed = True
+                    n_hopeless = 0
+                    stall_n = 0
+                    sweep_next = True  # fresh branch: sweep it once
+                    print(f"[ogc] Layer2 restart: perturbed construction adopted "
+                          f"(exact obj {co:.0f})  elapsed={self.elapsed():.2f}s")
+                elif co > 1.3 * cur_ox:
+                    n_hopeless += 1
+        return cur, progressed
+
+    # -- single-bay tardiness driver (run inside each parallel worker) --------
+    def _bay_round_driver(self, placements: list[Placement], bay_id: int,
+                          deadline: float, seed: int) -> list[Placement]:
+        """The per-bay analogue of _lns_rounds: same temp-ladder / fresh-seed
+        loop but pinned to one bay (only_bay).  The assignment is fixed, so
+        obj2/obj3 are constant and only this bay's tardiness moves; _exact_obj
+        over one bay's placements differs from the global value by that
+        constant offset, so its comparisons stay valid."""
+        cur = placements
+        cur_ox = self._exact_obj(cur)
+        stall_n = 0
+        round_i = 0
+        while time.time() < deadline:
+            pl, _, n_it = self.lns_improve(
+                cur, deadline=deadline, seed=seed + 7919 * round_i,
+                stall_frac=0.25, do_sweep=(round_i == 0), only_bay=bay_id,
+                temp=(0.0, 0.5, 1.0, 1.5)[min(stall_n, 3)], verbose=False)
+            round_i += 1
+            o = self._exact_obj(pl)
+            stall_n = 0 if o < cur_ox else stall_n + 1
+            cur, cur_ox = pl, o
+            if n_it == 0:
+                break
+        return cur
+
+    # -- parallel per-bay tardiness refinement (uses the idle cores) ----------
+    def parallel_bay_refine(self, placements: list[Placement],
+                            deadline: float) -> tuple[list[Placement], bool]:
+        """Refine each bay's tardiness in a SEPARATE PROCESS.  Bays have
+        independent cranes and, with the assignment fixed, obj2/obj3 are
+        constant, so per-bay tardiness minimisation is fully separable: every
+        block stays in its bay (only_bay), the results merge exactly, and the
+        merged objective can only be <= the input's.  The server allows 4
+        cores but the whole serial pipeline uses one -- this spends the rest.
+
+        Robust to a locked-down environment: process creation, pickling, or a
+        hung worker all degrade to a no-op keeping the incumbent, and the main
+        process is never blocked on a worker (shutdown wait=False).  The final
+        official check_feasibility still gates acceptance in solve()."""
+        n_bays = len(self.bays)
+        if n_bays < 2 or time.time() >= deadline:
+            return placements, False
+
+        by_bay: dict[int, list[Placement]] = {}
+        for p in placements:
+            by_bay.setdefault(p.bay_id, []).append(p)
+
+        def imp_tard(ps: list[Placement]) -> float:
+            s = 0.0
+            for p in ps:
+                bd = self.blocks[p.block_id]
+                s += (max(0, p.exit_time - bd["due_date"])
+                      - max(0, bd["release_time"] + bd["processing_time"] - bd["due_date"]))
+            return s
+
+        targets = [b for b, ps in by_bay.items() if len(ps) >= 2 and imp_tard(ps) > 0]
+        if not targets:
+            return placements, False
+
+        results: dict[int, list] = {}
+        pool = None
+        try:
+            import multiprocessing as mp
+            tasks = []
+            for b in targets:
+                pt = [(p.block_id, p.bay_id, p.x, p.y, p.orient_idx,
+                       p.entry_time, p.exit_time) for p in by_bay[b]]
+                tasks.append((b, (self.prob, self.timelimit, b, pt, deadline,
+                                  0xC0FFEE + 104729 * b)))
+            # multiprocessing.Pool (NOT ProcessPoolExecutor): its terminate()
+            # forcibly kills every worker, which is essential here.  A cooperative
+            # shutdown leaks Windows spawn workers, and dozens of leaked workers
+            # across a run thrash the CPU into hour-long stalls -- a fatal
+            # time-budget violation.  Default start method (fork on the Linux
+            # server = cheap, spawn on Windows dev) keeps this portable.
+            pool = mp.Pool(processes=min(4, len(targets)))
+            asyncs = [(b, pool.apply_async(_bay_lns_worker, (task,)))
+                      for b, task in tasks]
+            # Workers self-stop at `deadline`; the grace beyond it covers one
+            # in-flight iteration.  A per-get timeout guarantees the main process
+            # never waits unboundedly, and terminate() below reaps everything.
+            hard = deadline + 2.0
+            for b, ar in asyncs:
+                try:
+                    results[b] = ar.get(timeout=max(0.05, hard - time.time()))
+                except Exception:
+                    pass  # this bay times out / errors: keep its original
+        except Exception as exc:
+            print(f"[ogc] Parallel refine: unavailable ({exc!r}) -- skipped")
+            return placements, False
+        finally:
+            if pool is not None:
+                pool.terminate()  # forcibly kill workers NOW -- never leak
+                pool.join()
+
+        merged: list[Placement] = []
+        for b, ps in by_bay.items():
+            r = results.get(b)
+            if r:
+                merged.extend(Placement(*t) for t in r)
+            else:
+                merged.extend(ps)  # worker failed/absent: keep this bay as-is
+        if self._exact_obj(merged) < self._exact_obj(placements) - 1e-9:
+            return merged, True
+        return placements, False
 
     # ======================================================================
     # Layer 3: Gurobi timing MILP (decomposed subproblem)
@@ -1552,6 +1732,24 @@ class Solver:
     # Pipeline
     # ======================================================================
 
+    def _try_accept(self, tag: str, placements: list[Placement],
+                    best_placements: list[Placement], best_obj: float
+                    ) -> tuple[list[Placement], float]:
+        """Replace the incumbent with `placements` iff the OFFICIAL checker
+        confirms it feasible AND strictly better; otherwise keep the incumbent.
+        Returns the (possibly updated) (best_placements, best_obj)."""
+        cand = {"operations": _build_operations(placements)}
+        res = check_feasibility(self.prob, cand)
+        if res["feasible"] and res["objective"] < best_obj:
+            self.best_sol = cand
+            print(f"[ogc] {tag}: FEASIBLE  obj={res['objective']:.0f}  "
+                  f"(obj1={res['obj1']:.1f} obj2={res['obj2']:.1f} obj3={res['obj3']:.1f})  "
+                  f"elapsed={self.elapsed():.2f}s")
+            return placements, res["objective"]
+        why = "not better" if res["feasible"] else f"INFEASIBLE stage={res['stage']}"
+        print(f"[ogc] {tag}: rejected ({why}) -- keeping incumbent")
+        return best_placements, best_obj
+
     def solve(self) -> dict:
         print(f"[ogc] Instance : {self.prob.get('name', '?')}  "
               f"bays={len(self.bays)}  blocks={len(self.blocks)}  timelimit={self.timelimit:.1f}s")
@@ -1640,11 +1838,45 @@ class Solver:
         # tardiness.  If it has overtaken the incumbent by then, the LNS
         # continues on that branch; otherwise the remaining half runs on the
         # incumbent as usual -- the loss is bounded at half the LNS budget.
+        # Budget split for the parallel per-bay phase: spawning processes is
+        # worth it only when the LNS window is large relative to a single
+        # construction (measured _l1_secs) AND there is improvable tardiness to
+        # chase -- i.e. the large-TL congested regime where serial descent
+        # plateaus (prob_23/26 class).  When reserved, serial keeps the first
+        # half of the window (cross-bay balance/pref + the speculative branch)
+        # and the parallel per-bay drivers get the second half; if the parallel
+        # phase finds nothing, a serial continuation reclaims the remainder, so
+        # no window is ever left idle.  The 10x threshold is RELATIVE (a
+        # multiple of measured construction time), so it self-scales with
+        # instance size and machine speed -- confirmed off at TL=30, on at
+        # TL=300 for the congested instances.
+        lns_end = self.t_start + self.timelimit * LNS_SAFETY
+
+        def _improvable_tard(pls: list[Placement]) -> float:
+            s = 0.0
+            for p in pls:
+                bd = self.blocks[p.block_id]
+                s += (max(0, p.exit_time - bd["due_date"])
+                      - max(0, bd["release_time"] + bd["processing_time"] - bd["due_date"]))
+            return s
+
+        _l1 = getattr(self, "_l1_secs", None)
+        use_par = (len(self.bays) >= 2 and _l1 is not None
+                   and (lns_end - time.time()) > 10.0 * _l1
+                   and _improvable_tard(lns_input) > 0)
+        # Serial keeps 1/(n_bays+1) of the window for its unique work (cross-bay
+        # balance/pref + the speculative branch); the rest funds the parallel
+        # per-bay drivers, whose tardiness throughput scales with the bay count.
+        # So the more bays, the smaller the serial share -- 1/3 at 2 bays, 1/4
+        # at 3 -- matching where parallel pays off most.
+        serial_frac = 1.0 / (len(self.bays) + 1)
+        serial_deadline = (time.time() + serial_frac * (lns_end - time.time())
+                           if use_par else lns_end)
+
         spec_adopted = False
         try:
             if spec is not None and self.time_left() > 0:
-                lns_deadline = self.t_start + self.timelimit * LNS_SAFETY
-                mid = time.time() + 0.5 * (lns_deadline - time.time())
+                mid = time.time() + 0.5 * (serial_deadline - time.time())
                 # The trial runs in three segments with a linear-extrapolation
                 # abort: if the measured recovery rate cannot close the gap to
                 # the incumbent within the trial window, stop gambling NOW and
@@ -1681,91 +1913,35 @@ class Solver:
 
         try:
             if self.time_left() > 0:
-                # Round loop: each LNS round returns early once it plateaus
-                # (stall_frac); the freed window funds perturbed-order
-                # construction RESTARTS (adopted only when strictly better by
-                # the exact objective) and fresh-seed LNS rounds.  This
-                # attacks the two measured stall modes at once: the greedy
-                # construction's own quality ceiling (prob_23/26 class) and
-                # seed exhaustion in long windows (prob_4 class).
-                lns_deadline = self.t_start + self.timelimit * LNS_SAFETY
+                # Serial round driver on the first (or whole) window: each round
+                # returns early once it plateaus (stall_frac); the freed time
+                # funds perturbed-order construction restarts and fresh-seed /
+                # rising-temperature rounds (see _lns_rounds).
                 margin = 0.02 * self.timelimit
-                cur = lns_input
-                cur_ox = self._exact_obj(cur)
-                progressed = spec_adopted
                 base_seed = 0x5EED if spec_adopted else 0xC0FFEE
-                round_i = 0
-                n_hopeless = 0  # consecutive restarts far off the incumbent
-                sweep_next = True  # sweep only fresh branches, not replays
-                stall_n = 0  # consecutive rounds without strict improvement
-                while time.time() < lns_deadline - margin:
-                    # Temperature ladder: descent first; after each stalled
-                    # round escalate the SA temperature so sequencing-bound
-                    # tardiness (zero-sum shifts with no improving neighbour)
-                    # can pass through temporarily worse re-sequencings.
-                    pl, _, n_it = self.lns_improve(
-                        cur, deadline=lns_deadline,
-                        seed=base_seed + 7919 * round_i, stall_frac=0.25,
-                        do_sweep=sweep_next,
-                        temp=(0.0, 0.5, 1.0, 1.5)[min(stall_n, 3)])
-                    sweep_next = False
-                    round_i += 1
-                    o = self._exact_obj(pl)
-                    if o < cur_ox:
-                        progressed = True
-                        stall_n = 0
-                    else:
-                        stall_n += 1
-                    cur, cur_ox = pl, o  # a round never returns worse than its input
-                    if n_it == 0:
-                        break  # nothing left to iterate on
-                    remaining = lns_deadline - time.time()
-                    if remaining <= margin:
-                        break
-                    # Plateaued with time to spare: perturbed restart if the
-                    # window affords a construction (measured Layer-1 cost).
-                    est = getattr(self, "_l1_secs", None)
-                    if est is not None and n_hopeless < 3 and \
-                            remaining > 1.6 * est + margin:
-                        # Budget floor RELATIVE to the timelimit: candidate
-                        # quality is wildly non-monotone in the budget when it
-                        # sits barely above the per-block minimum (measured on
-                        # prob_8: same seed gives 12412 or 2.0M depending on
-                        # jitter), and two unlucky draws used to disable
-                        # restarts for good.
-                        cand = self.build_coexist(
-                            deadline=time.time() + min(remaining * 0.5,
-                                                       max(1.5 * est, 0.03 * self.timelimit)),
-                            order_rng=random.Random(0xA11CE + round_i),
-                            order_noise=(0.08, 0.25, 0.6)[round_i % 3])
-                        co = self._exact_obj(cand)
-                        if co < cur_ox:
-                            cur, cur_ox = cand, co
-                            progressed = True
-                            n_hopeless = 0
-                            stall_n = 0
-                            sweep_next = True  # fresh branch: sweep it once
-                            print(f"[ogc] Layer2 restart: perturbed construction adopted "
-                                  f"(exact obj {co:.0f})  elapsed={self.elapsed():.2f}s")
-                        elif co > 1.3 * cur_ox:
-                            # Construction-scale quality is far off the
-                            # incumbent (e.g. after a big master gain): two
-                            # such misses in a row stop further restarts.
-                            n_hopeless += 1
-                lns_placements = cur
+                cur, progressed = self._lns_rounds(lns_input, serial_deadline,
+                                                   base_seed, spec_adopted, True)
                 if progressed:
-                    cand = {"operations": _build_operations(lns_placements)}
-                    res2 = check_feasibility(self.prob, cand)
-                    if res2["feasible"] and res2["objective"] < best_obj:
-                        self.best_sol = cand
-                        best_obj = res2["objective"]
-                        best_placements = lns_placements
-                        print(f"[ogc] Layer2 accept : FEASIBLE  obj={res2['objective']:.0f}  "
-                              f"(obj1={res2['obj1']:.1f} obj2={res2['obj2']:.1f} obj3={res2['obj3']:.1f})  "
-                              f"elapsed={self.elapsed():.2f}s")
-                    else:
-                        why = "not better" if res2["feasible"] else f"INFEASIBLE stage={res2['stage']}"
-                        print(f"[ogc] Layer2 accept : rejected ({why}) -- keeping incumbent")
+                    best_placements, best_obj = self._try_accept(
+                        "Layer2 accept ", cur, best_placements, best_obj)
+
+                # Parallel per-bay tardiness refinement on the otherwise-idle
+                # cores (bays are independent; with the assignment fixed the
+                # merge is exact and can only lower the objective).  Any failure
+                # is a no-op; the official checker in _try_accept still gates.
+                if use_par and time.time() < lns_end - margin:
+                    pl_par, improved = self.parallel_bay_refine(best_placements, lns_end)
+                    if improved:
+                        best_placements, best_obj = self._try_accept(
+                            "Parallel refine", pl_par, best_placements, best_obj)
+                    # Reclaim any idle remainder (parallel returned early) with a
+                    # serial continuation to the full window.
+                    if time.time() < lns_end - margin:
+                        cur2, prog2 = self._lns_rounds(best_placements, lns_end,
+                                                       base_seed + 31, False, False)
+                        if prog2:
+                            best_placements, best_obj = self._try_accept(
+                                "Layer2 accept ", cur2, best_placements, best_obj)
         except Exception as exc:  # defensive: incumbent survives any Layer-2 bug
             print(f"[ogc] Layer2 failed ({exc!r}) -- keeping incumbent")
 
@@ -1793,6 +1969,26 @@ class Solver:
             print(f"[ogc] Layer3b failed ({exc!r}) -- keeping incumbent")
 
         return self.best_sol
+
+
+# ---------------------------------------------------------------------------
+# Process-pool entry for parallel per-bay refinement
+# ---------------------------------------------------------------------------
+
+def _bay_lns_worker(args):
+    """Refine ONE bay's tardiness and return placement tuples.  Top-level so
+    it is picklable for ProcessPoolExecutor (spawn re-imports this module,
+    which has no import-time side effects).  Any failure returns the input
+    unchanged, so the parent can safely keep the incumbent for that bay."""
+    prob_info, timelimit, bay_id, ptuples, deadline, seed = args
+    try:
+        solver = Solver(prob_info, timelimit)
+        pls = [Placement(*t) for t in ptuples]
+        out = solver._bay_round_driver(pls, bay_id, deadline, seed)
+        return [(p.block_id, p.bay_id, p.x, p.y, p.orient_idx,
+                 p.entry_time, p.exit_time) for p in out]
+    except Exception:
+        return ptuples
 
 
 # ---------------------------------------------------------------------------
