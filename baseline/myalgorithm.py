@@ -117,6 +117,23 @@ def _block_bbox(block_data: dict, orient_idx: int) -> tuple[float, float, float,
     return _bounding_box(all_verts)
 
 
+def _dispose(model, env) -> None:
+    """Release a Gurobi model and its environment, in that order.
+
+    Order matters: an Env whose models are still alive defers its own release,
+    so disposing only the env leaks the whole environment -- threads included.
+    One leak per call is invisible in a single solve and lethal across a batch:
+    with the bound MILP now running on every instance, a 40-instance sweep hit
+    679s of wall clock on a 30s limit while the same instance alone took 25.8s.
+    """
+    for obj in (model, env):
+        try:
+            if obj is not None:
+                obj.dispose()
+        except Exception:
+            pass
+
+
 def _build_operations(placements: list[Placement]) -> dict:
     """Group placements into the solution "operations" dict: keyed by integer
     time (as str), EXIT before ENTRY at each time, then ordered by block_id.
@@ -173,6 +190,9 @@ class Solver:
         self._flag_cache: dict = {}
         self._flag_cache_cap = 2_000_000
         self.best_sol: dict | None = None  # always feasible once the floor is built
+        # Best dual bound on w2*obj2 + w3*obj3 the reassignment master has
+        # proved so far, or None while it has proved none; see _lower_bound.
+        self._o23_bound: float | None = None
 
     # -- time ----------------------------------------------------------------
     def time_left(self) -> float:
@@ -1125,6 +1145,32 @@ class Solver:
 
     # -- serial round driver (factored out of solve so it can run on either a
     #    half window before the parallel phase or the reclaimed remainder) ----
+    def _lower_bound(self) -> float | None:
+        """A valid global lower bound on the objective, or None if we have not
+        proved one.  The two terms bound the two halves independently:
+
+          w1 * sum_i max(0, release_i + processing_i - due_i)
+              -- exit_i >= entry_i + processing_i >= release_i + processing_i,
+                 so this is under every block's tardiness at once; plus
+          the master's MILP dual bound on w2*obj2 + w3*obj3, recorded only from
+          a run with the trust region off (see milp_reassign).
+
+        Only sound because both halves are bounds on the SAME solution for any
+        solution -- obj1 and the assignment terms are independent variables."""
+        if self._o23_bound is None:
+            return None
+        return self.w1 * sum(
+            max(0, bd["release_time"] + bd["processing_time"] - bd["due_date"])
+            for bd in self.blocks) + self._o23_bound
+
+    def _proven_optimal(self, obj: float) -> bool:
+        """True once the incumbent has reached that bound, so no amount of
+        further search can pay.  Measured motivation: prob_8 reaches its bound
+        at 39% of the time limit and then spends 2100 iterations finding
+        nothing, because by then there is nothing left to find."""
+        lb = self._lower_bound()
+        return lb is not None and obj <= lb + 1e-9
+
     def _lns_rounds(self, cur: list[Placement], deadline: float,
                     base_seed: int, spec_adopted: bool,
                     sweep_first: bool) -> tuple[list[Placement], bool]:
@@ -1139,7 +1185,7 @@ class Solver:
         n_hopeless = 0            # consecutive restarts far off the incumbent
         sweep_next = sweep_first  # sweep only fresh branches, not replays
         stall_n = 0               # consecutive rounds without strict improvement
-        while time.time() < deadline - margin:
+        while time.time() < deadline - margin and not self._proven_optimal(cur_ox):
             # Temperature ladder: descent first; after each stalled round
             # escalate the SA temperature so sequencing-bound tardiness can
             # pass through temporarily worse re-sequencings.
@@ -1157,6 +1203,10 @@ class Solver:
             else:
                 stall_n += 1
             cur, cur_ox = pl, o
+            if self._proven_optimal(cur_ox):
+                print(f"[ogc] Layer2 proven : incumbent {cur_ox:.0f} equals the provable "
+                      f"lower bound -- search stops  elapsed={self.elapsed():.2f}s")
+                break
             if n_it == 0:
                 break  # nothing left to iterate on
             remaining = deadline - time.time()
@@ -1352,6 +1402,73 @@ class Solver:
     #   their MILP bay via the Layer-1 search, and the candidate is kept only
     #   if the EXACT full objective (and then the official checker) improves.
 
+    def prove_o23_bound(self, placements: list[Placement], deadline: float) -> None:
+        """Prove a dual bound on w2*obj2 + w3*obj3 and record it in
+        `_o23_bound`.  Deliberately decoupled from milp_reassign: what is
+        expensive there is REALISING an assignment (a rebuild costs a whole
+        Layer-1 construction), never the MILP, which is a few hundred binaries
+        and solves in a fraction of a second.  Tying the two together meant the
+        congested half of the training set -- the very instances whose gap we
+        most need to know -- proved no bound at all, because their realisation
+        was unaffordable.  Proving costs almost nothing, so it always runs.
+
+        The model is the assignment relaxation of the real problem: every block
+        picks one bay it fits in, obj3 is exact and linear, obj2 is an exact
+        epigraph on the unfloored imbalance.  Nothing constrains it towards the
+        incumbent (no trust region), so its dual bound is global.
+        """
+        if (self._o23_bound is not None or len(self.bays) < 2
+                or time.time() >= deadline or (self.w2 <= 0 and self.w3 <= 0)):
+            return
+        try:
+            import gurobipy as gp
+            from gurobipy import GRB
+            env = gp.Env(empty=True)
+            env.setParam("OutputFlag", 0)
+            env.start()
+        except Exception:
+            return  # no gurobi: we simply have no bound, everything else runs
+        n_bays = len(self.bays)
+        areas = [b.width * b.height for b in self.bays]
+        u = [(sum(areas) / n_bays) / a for a in areas]
+        try:
+            m = gp.Model(env=env)
+            z = {}
+            for p in placements:
+                bd = self.blocks[p.block_id]
+                fit = [b.id for b in self.bays
+                       if b.id == p.bay_id or self._fit_position(bd, b) is not None]
+                for j in fit:
+                    z[(p.block_id, j)] = m.addVar(vtype=GRB.BINARY)
+                m.addConstr(gp.quicksum(z[(p.block_id, j)] for j in fit) == 1)
+            load = {j: gp.quicksum(self.blocks[bi]["workload"] * v
+                                   for (bi, jj), v in z.items() if jj == j)
+                    for j in range(n_bays)}
+            I = m.addVar(lb=0.0)
+            for j1 in range(n_bays):
+                for j2 in range(j1 + 1, n_bays):
+                    m.addConstr(I >= u[j1] * load[j1] - u[j2] * load[j2])
+                    m.addConstr(I >= u[j2] * load[j2] - u[j1] * load[j1])
+            pref = gp.quicksum(
+                (max(self.blocks[bi]["bay_preferences"]) - self.blocks[bi]["bay_preferences"][j]) * v
+                for (bi, j), v in z.items())
+            m.setObjective(self.w2 * I + self.w3 * pref, GRB.MINIMIZE)
+            m.Params.TimeLimit = max(0.05, min(deadline - time.time(),
+                                               0.03 * self.timelimit))
+            m.Params.Threads = 4
+            m.optimize()
+            # ObjBound is valid even when the solve is cut short.  The checker
+            # scores floor(I), and floor(I) >= I - 1, hence the -w2 slack.  The
+            # max(.., 0) covers a solve cut short before any bound exists, when
+            # Gurobi reports -1e100: zero is a valid bound for a sum of
+            # non-negative terms, and an unguarded -1e100 would silently make
+            # every later gap figure meaningless.
+            self._o23_bound = max(m.ObjBound, 0.0) - self.w2
+        except Exception:
+            return
+        finally:
+            _dispose(locals().get("m"), env)
+
     def milp_reassign(self, placements: list[Placement], deadline: float,
                       ) -> tuple[list[Placement], str, list[Placement] | None]:
         """One master-reassignment round.  Returns (certain, status, spec):
@@ -1427,6 +1544,19 @@ class Solver:
                                                max(1.0, 0.05 * self.timelimit)))
             m.Params.Threads = 4
             m.optimize()
+            # Record a VALID global lower bound on w2*obj2 + w3*obj3 whenever
+            # this model is entitled to give one.  Two conditions matter and
+            # both are easy to get wrong:
+            #   * the move cap must be off (max_moves >= n).  With the trust
+            #     region on, the model has excluded assignments, so its
+            #     optimum is merely local and bounds nothing globally.
+            #   * use ObjBound, not the incumbent's value -- the MILP is time
+            #     sliced and often stops before proving optimality.
+            # ObjBound bounds w2*I + w3*pref, while the checker scores
+            # w2*floor(I) + w3*pref >= w2*(I-1) + w3*pref, hence the -w2.
+            if max_moves >= n:
+                b = max(m.ObjBound, 0.0) - self.w2
+                self._o23_bound = b if self._o23_bound is None else max(self._o23_bound, b)
             if m.SolCount == 0:
                 return placements, "none", None
             target = {bi: j for (bi, j), v in z.items() if v.X > 0.5}
@@ -1434,10 +1564,7 @@ class Solver:
             print(f"[ogc] Layer3 master  : MILP error ({exc!r})")
             return placements, "none", None
         finally:
-            try:
-                env.dispose()
-            except Exception:
-                pass
+            _dispose(locals().get("m"), env)
 
         moved = [bi for bi, j in target.items() if j != cur_bay[bi]]
         if not moved:
@@ -1470,6 +1597,12 @@ class Solver:
                 for bd in self.blocks)
             o23 = new_obj - self.w1 * sum(
                 max(0.0, p.exit_time - self.blocks[p.block_id]["due_date"]) for p in cand)
+            # NOTE this is the SPECULATIVE branch's own floor, not a global
+            # bound: o23 is measured on the realised rebuild (fallbacks can put
+            # a block outside its assigned bay) and the master may have run
+            # under the trust region.  It decides whether this branch is worth
+            # part of the LNS budget and nothing else; the global bound comes
+            # from the MILP's dual bound in _lower_bound.
             floor_obj = self.w1 * total_min_tard + o23
             if floor_obj < base_obj:
                 print(f"[ogc] Layer3 master  : speculative rebuild kept (obj {new_obj:.0f}, "
@@ -1639,10 +1772,7 @@ class Solver:
                 n_improved += 1
                 gain += g
 
-        try:
-            env.dispose()
-        except Exception:
-            pass
+        _dispose(None, env)
         if not new_times:
             print(f"[ogc] Layer3 MILP    : no timing improvement  elapsed={self.elapsed():.2f}s")
             return placements, 0
@@ -1727,6 +1857,11 @@ class Solver:
         except Exception as exc:
             print(f"[ogc]   Layer3 bay {bay_id}: MILP error ({exc!r})")
             return None  # any Gurobi hiccup: keep the incumbent times
+        finally:
+            # One model per bay per call, and all three exits above return
+            # directly -- without this the loop in milp_refine_times leaks a
+            # model on every bay it touches.
+            _dispose(locals().get("m"), None)
 
     # ======================================================================
     # Pipeline
@@ -1805,12 +1940,44 @@ class Solver:
         # LNS budget then work on recovering any tardiness the moves induced.
         # Accept contract as always: exact-objective improvement inside, then
         # the official checker before the incumbent is replaced.
+        #
+        # The master only pays by REALISING its assignment, and every route to
+        # that -- constrained rebuild, or a stepwise move plus its repair --
+        # costs on the order of one Layer-1 construction.  So when the measured
+        # construction time already exceeds the master's whole window, the
+        # master cannot realise anything and the window is pure loss.  The test
+        # comes from the cost of the operation, not from tuning: it switches
+        # the master off exactly on the construction-bound instances (measured
+        # at TL=60: prob_38 spends 72% of the limit constructing and its master
+        # returned "no improving prefix"; prob_23 likewise) and leaves it on
+        # where it does the work (prob_1, prob_8: 0.2s and 0.05s constructions,
+        # and the master is what certifies their optimum).
         lns_input = best_placements
         spec = None
+        m_window = min(0.08 * self.timelimit,
+                       self.t_start + self.timelimit * 0.78 - time.time())
+        _l1_cost = getattr(self, "_l1_secs", None)
+
+        # Prove the bound first and unconditionally -- it is cheap, it survives
+        # the gate below, and it splits the remaining headroom into the two
+        # independent directions the rest of the pipeline can spend time on.
         try:
-            if self.time_left() > 0:
-                m_deadline = min(time.time() + 0.08 * self.timelimit,
-                                 self.t_start + self.timelimit * 0.78)
+            self.prove_o23_bound(best_placements, time.time() + 0.03 * self.timelimit)
+            lb = self._lower_bound()
+            if lb is not None:
+                print(f"[ogc] Bound        : lower bound {lb:.0f}, incumbent {best_obj:.0f} "
+                      f"-- gap {100.0 * (best_obj - lb) / max(best_obj, 1):.1f}%  "
+                      f"elapsed={self.elapsed():.2f}s")
+        except Exception as exc:
+            print(f"[ogc] Bound failed ({exc!r}) -- continuing without one")
+
+        try:
+            if _l1_cost is not None and m_window < _l1_cost:
+                print(f"[ogc] Layer3a skip  : window {m_window:.1f}s buys less than one "
+                      f"construction ({_l1_cost:.1f}s) -- no move could be realised; "
+                      f"the time goes to the LNS")
+            elif self.time_left() > 0:
+                m_deadline = time.time() + m_window
                 r_placements, status, spec = self.milp_reassign(best_placements, m_deadline)
                 if status == "better":
                     cand = {"operations": _build_operations(r_placements)}
@@ -1875,7 +2042,17 @@ class Solver:
 
         spec_adopted = False
         try:
-            if spec is not None and self.time_left() > 0:
+            if spec is not None and self.time_left() > 0 and not self._proven_optimal(best_obj):
+                # Sizing this from the proven gap split was tried and is WRONG:
+                # the bound's two halves are independent enough to be valid
+                # bounds but not to be achievable independently.  Realising the
+                # assignment optimum reschedules, and rescheduling costs
+                # tardiness at rate w1 -- on prob_11 the master's rebuild does
+                # reach the optimal assignment, worth 92k, by inducing ~81
+                # tardiness worth 22,857 each.  So a large proven assignment gap
+                # is no reason to bet more of the window on realising it; the
+                # in-trial extrapolation abort below, which measures the actual
+                # recovery rate, is the honest test.
                 mid = time.time() + 0.5 * (serial_deadline - time.time())
                 # The trial runs in three segments with a linear-extrapolation
                 # abort: if the measured recovery rate cannot close the gap to
@@ -1929,7 +2106,8 @@ class Solver:
                 # cores (bays are independent; with the assignment fixed the
                 # merge is exact and can only lower the objective).  Any failure
                 # is a no-op; the official checker in _try_accept still gates.
-                if use_par and time.time() < lns_end - margin:
+                if (use_par and time.time() < lns_end - margin
+                        and not self._proven_optimal(best_obj)):
                     pl_par, improved = self.parallel_bay_refine(best_placements, lns_end)
                     if improved:
                         best_placements, best_obj = self._try_accept(
@@ -1950,7 +2128,7 @@ class Solver:
         # official checker confirms it feasible AND strictly better.  With no
         # gurobipy / no license / no improvable tardiness this is a no-op.
         try:
-            if self.time_left() > 0:
+            if self.time_left() > 0 and not self._proven_optimal(best_obj):
                 m_placements, n_imp = self.milp_refine_times(best_placements)
                 if n_imp > 0:
                     cand = {"operations": _build_operations(m_placements)}
