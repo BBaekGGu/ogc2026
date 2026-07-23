@@ -1267,10 +1267,15 @@ class Solver:
         merged objective can only be <= the input's.  The server allows 4
         cores but the whole serial pipeline uses one -- this spends the rest.
 
+        Cores are filled by bay first and then by SEED: when there are fewer
+        improvable bays than cores, the leftovers re-run a high-headroom bay
+        under a different seed and the merge keeps whichever came back best.
+
         Robust to a locked-down environment: process creation, pickling, or a
-        hung worker all degrade to a no-op keeping the incumbent, and the main
-        process is never blocked on a worker (shutdown wait=False).  The final
-        official check_feasibility still gates acceptance in solve()."""
+        hung worker all degrade to a no-op keeping the incumbent, and no get()
+        can block the main process past the deadline grace.  The pool is always
+        terminated in `finally`, and the final official check_feasibility still
+        gates acceptance in solve()."""
         n_bays = len(self.bays)
         if n_bays < 2 or time.time() >= deadline:
             return placements, False
@@ -1290,35 +1295,66 @@ class Solver:
         targets = [b for b, ps in by_bay.items() if len(ps) >= 2 and imp_tard(ps) > 0]
         if not targets:
             return placements, False
+        # Most headroom first: that is where both the first worker and any
+        # spare core are worth the most.
+        targets.sort(key=lambda b: -imp_tard(by_bay[b]))
 
         results: dict[int, list] = {}
         pool = None
         try:
+            import os
             import multiprocessing as mp
+            # The competition box caps us at 400% CPU, so 4 workers is the most
+            # that can ever run; ask the machine in case it offers fewer.
+            n_cores = max(1, min(4, os.cpu_count() or 1))
+            # One worker per bay leaves cores idle whenever there are fewer
+            # improvable bays than cores -- the common case (prob_23 has 2 bays,
+            # so half the box sat unused even with this phase switched on).
+            # Spare cores go to EXTRA SEEDS on the bays with the most headroom.
+            # Same bay, different seed is a portfolio, not a split: each worker
+            # runs the full window and returns its own best-seen, and the merge
+            # below keeps the best result per bay, so an extra seed can only
+            # help.  This is worth doing precisely because the LNS is stochastic
+            # with heavy per-run spread (measured 1.45-3.25x on some instances).
+            slots: list[tuple[int, int]] = []          # (bay, seed index)
+            for k in range(max(n_cores, 1)):
+                if k < len(targets):
+                    slots.append((targets[k], 0))      # every bay gets one...
+                elif targets:
+                    b = targets[(k - len(targets)) % len(targets)]
+                    slots.append((b, 1 + (k - len(targets)) // len(targets)))
+                if len(slots) >= n_cores:
+                    break
             tasks = []
-            for b in targets:
+            for b, si in slots:
                 pt = [(p.block_id, p.bay_id, p.x, p.y, p.orient_idx,
                        p.entry_time, p.exit_time) for p in by_bay[b]]
                 tasks.append((b, (self.prob, self.timelimit, b, pt, deadline,
-                                  0xC0FFEE + 104729 * b)))
+                                  0xC0FFEE + 104729 * b + 7919 * si)))
             # multiprocessing.Pool (NOT ProcessPoolExecutor): its terminate()
             # forcibly kills every worker, which is essential here.  A cooperative
             # shutdown leaks Windows spawn workers, and dozens of leaked workers
             # across a run thrash the CPU into hour-long stalls -- a fatal
             # time-budget violation.  Default start method (fork on the Linux
             # server = cheap, spawn on Windows dev) keeps this portable.
-            pool = mp.Pool(processes=min(4, len(targets)))
+            # One process per slot: every worker runs the whole window, so a
+            # queued task would never get to start.  Sizing the pool to the
+            # slots keeps that from happening.
+            pool = mp.Pool(processes=len(slots))
             asyncs = [(b, pool.apply_async(_bay_lns_worker, (task,)))
                       for b, task in tasks]
+            print(f"[ogc] Parallel refine: {len(slots)} worker(s) over "
+                  f"{len(set(b for b, _ in slots))} bay(s) on {n_cores} core(s)")
             # Workers self-stop at `deadline`; the grace beyond it covers one
             # in-flight iteration.  A per-get timeout guarantees the main process
             # never waits unboundedly, and terminate() below reaps everything.
             hard = deadline + 2.0
             for b, ar in asyncs:
                 try:
-                    results[b] = ar.get(timeout=max(0.05, hard - time.time()))
+                    results.setdefault(b, []).append(
+                        ar.get(timeout=max(0.05, hard - time.time())))
                 except Exception:
-                    pass  # this bay times out / errors: keep its original
+                    pass  # this worker times out / errors: the others still count
         except Exception as exc:
             print(f"[ogc] Parallel refine: unavailable ({exc!r}) -- skipped")
             return placements, False
@@ -1327,13 +1363,32 @@ class Solver:
                 pool.terminate()  # forcibly kill workers NOW -- never leak
                 pool.join()
 
+        def imp_tard_tuples(rows) -> float:
+            # Same quantity as imp_tard, read off the worker's return tuples
+            # (block_id, bay_id, x, y, orient_idx, entry_time, exit_time).
+            s = 0.0
+            for row in rows:
+                bd = self.blocks[row[0]]
+                s += (max(0, row[6] - bd["due_date"])
+                      - max(0, bd["release_time"] + bd["processing_time"] - bd["due_date"]))
+            return s
+
         merged: list[Placement] = []
         for b, ps in by_bay.items():
-            r = results.get(b)
-            if r:
-                merged.extend(Placement(*t) for t in r)
+            # With the assignment fixed, this bay's block set -- and therefore
+            # its obj2/obj3 contribution -- is identical across every candidate,
+            # so ranking them by tardiness ranks them by objective exactly.
+            best_t, best_rows = imp_tard(ps), None
+            for rows in results.get(b) or []:
+                if not rows:
+                    continue
+                t = imp_tard_tuples(rows)
+                if t < best_t - 1e-9:
+                    best_t, best_rows = t, rows
+            if best_rows is not None:
+                merged.extend(Placement(*row) for row in best_rows)
             else:
-                merged.extend(ps)  # worker failed/absent: keep this bay as-is
+                merged.extend(ps)  # every worker failed or none improved: keep as-is
         if self._exact_obj(merged) < self._exact_obj(placements) - 1e-9:
             return merged, True
         return placements, False
