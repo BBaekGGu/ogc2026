@@ -1941,17 +1941,24 @@ class Solver:
         # Accept contract as always: exact-objective improvement inside, then
         # the official checker before the incumbent is replaced.
         #
-        # The master only pays by REALISING its assignment, and every route to
-        # that -- constrained rebuild, or a stepwise move plus its repair --
-        # costs on the order of one Layer-1 construction.  So when the measured
-        # construction time already exceeds the master's whole window, the
-        # master cannot realise anything and the window is pure loss.  The test
-        # comes from the cost of the operation, not from tuning: it switches
-        # the master off exactly on the construction-bound instances (measured
-        # at TL=60: prob_38 spends 72% of the limit constructing and its master
-        # returned "no improving prefix"; prob_23 likewise) and leaves it on
-        # where it does the work (prob_1, prob_8: 0.2s and 0.05s constructions,
-        # and the master is what certifies their optimum).
+        # The master only pays by REALISING its assignment, via two routes:
+        #   * Path A (constrained rebuild) re-packs every bay from scratch and
+        #     costs one Layer-1 construction.
+        #   * Path B (stepwise) is cheap and anytime -- one relocation per move,
+        #     roughly one placement each -- so a small window never stops it.
+        # The gate below is therefore NOT about affording Path B.  It is about
+        # Path A being the only route that WORKS on these instances: Path B
+        # freezes every other block, so on a construction-bound (congested)
+        # instance the mover finds no tardiness-free landing and the prefix
+        # never improves.  Measured with the gate deliberately lifted so Path B
+        # could run: prob_23/30/35/38 at TL=30 and prob_38/39 at TL=300 ALL
+        # returned "no improving prefix" -- best case 0.001% (prob_36), typical
+        # case zero, while still spending the window.  A window under one
+        # construction thus leaves nothing realisable, so skip and let the LNS
+        # have the time.  (An earlier revision of this comment claimed a
+        # stepwise move also costs a construction; that was simply wrong -- the
+        # conclusion held for the other reason.)  The bound is proved above this
+        # point and survives the skip.
         lns_input = best_placements
         spec = None
         m_window = min(0.08 * self.timelimit,
@@ -1974,8 +1981,8 @@ class Solver:
         try:
             if _l1_cost is not None and m_window < _l1_cost:
                 print(f"[ogc] Layer3a skip  : window {m_window:.1f}s buys less than one "
-                      f"construction ({_l1_cost:.1f}s) -- no move could be realised; "
-                      f"the time goes to the LNS")
+                      f"construction ({_l1_cost:.1f}s), so the rebuild -- the only route "
+                      f"that realises anything here -- cannot run; time goes to the LNS")
             elif self.time_left() > 0:
                 m_deadline = time.time() + m_window
                 r_placements, status, spec = self.milp_reassign(best_placements, m_deadline)
