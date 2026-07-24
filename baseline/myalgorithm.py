@@ -41,6 +41,7 @@
 #   under the same feasible-and-better-or-rejected contract.  Without
 #   gurobipy or a license it degrades to a no-op.
 
+import os
 import time
 import math
 import random
@@ -1257,6 +1258,125 @@ class Solver:
                 break
         return cur
 
+    # -- whole-solution portfolio (uses the idle cores) -----------------------
+    @staticmethod
+    def _n_cores() -> int:
+        """Cores we may actually use.  The grader caps the whole process tree
+        at 400%, so four is the ceiling however big the machine is."""
+        return max(1, min(4, os.cpu_count() or 1))
+
+    def portfolio_search(self, placements: list[Placement], deadline: float,
+                         base_seed: int, spec_adopted: bool
+                         ) -> tuple[list[Placement], bool]:
+        """Run independent search branches on the idle cores and keep the best.
+
+        Each branch does exactly what the serial phase would -- a (perturbed)
+        construction followed by LNS rounds -- but on its own core.  That is
+        the whole point, and it is what separates this from serial best-of-k
+        start sampling, which was implemented and MEASURED TO LOSE: there the
+        extra starts were paid for out of the LNS budget, and LNS time is worth
+        far more than start quality (prob_4: LNS walks 317k -> 65k while
+        sampling buys 57k).  Here the branches run on cores that were idle, so
+        the LNS budget is untouched and the spread between branches -- measured
+        10-33% run to run on this pipeline, and 14% between two identical
+        server submissions -- converts straight into the winner's margin.
+
+        THE PARENT RUNS ONE BRANCH ITSELF instead of blocking on children, and
+        that detail is the whole safety argument.  Handing every branch to a
+        child was measured to LOSE: a child starts with a cold geometry cache
+        and shares the box with its siblings, so each branch is weaker than the
+        serial phase was, and the best of four weak branches can be worse than
+        one strong one (prob_17 at TL=30: the serial phase returned 78,472 in
+        three runs out of three, while four child branches returned 66,424 /
+        78,472 / 112,429 -- a worse tail on an instance that had none).  With
+        the serial branch kept in the parent -- warm cache, no spawn, exactly
+        the call it replaces -- the children can only add.
+
+        Failure of any branch, or of multiprocessing altogether, simply drops
+        that branch; the parent's own result still stands.
+        """
+        l1 = getattr(self, "_l1_secs", None)
+        # One branch stays here; the children fill the remaining cores.
+        n_extra = self._n_cores() - 1
+        if n_extra < 1 or l1 is None or time.time() >= deadline:
+            return self._lns_rounds(placements, deadline, base_seed,
+                                    spec_adopted, True)
+
+        base_tuples = [(p.block_id, p.bay_id, p.x, p.y, p.orient_idx,
+                        p.entry_time, p.exit_time) for p in placements]
+        # Keep the branches' caches inside the same total memory the single
+        # serial search was allowed, so the whole set cannot push us past the
+        # grader's 16GB.
+        cap = max(100_000, self._flag_cache_cap // (n_extra + 1))
+        # EVERY branch starts from the incumbent and differs only in its LNS
+        # seed.  Diversifying the CONSTRUCTION instead was tried and loses: the
+        # EDD order is far better than any perturbation of it, and equal LNS
+        # time never closes the gap (prob_13 at TL=300, 92s per branch:
+        # 171k for the incumbent's order against 233k/260k/282k for perturbed
+        # ones; the same effect killed serial best-of-k start sampling).  The
+        # spread we actually want to sample is the ANYTIME one -- construction
+        # and base seed are deterministic, so the 10-33% we measure run to run
+        # comes from how many iterations happen to fit, and independent seeds
+        # sample exactly that distribution.
+        # Seeds skip base_seed itself -- that one belongs to the parent's
+        # branch, and a duplicate would waste a core replaying it.
+        tasks = [(self.prob, self.timelimit, self.t_start, deadline,
+                  base_seed + 7919 * (k + 1), 0.0, base_tuples,
+                  l1, self._o23_bound, cap)
+                 for k in range(n_extra)]
+
+        out = []
+        pool = None
+        try:
+            try:
+                import multiprocessing as mp
+                # Pool + terminate(), never a cooperative shutdown: leaked spawn
+                # workers previously thrashed a whole benchmark into hour-long
+                # stalls.  See parallel_bay_refine for the incident.
+                pool = mp.Pool(processes=len(tasks))
+                asyncs = [pool.apply_async(_pipeline_worker, (t,)) for t in tasks]
+                print(f"[ogc] Portfolio    : 1 local + {len(tasks)} child branch(es) "
+                      f"on {self._n_cores()} core(s), "
+                      f"window {deadline - time.time():.1f}s")
+            except Exception as exc:
+                print(f"[ogc] Portfolio    : extra branches unavailable ({exc!r}) "
+                      f"-- the local branch runs alone")
+                asyncs = []
+
+            # The parent searches too rather than idling on a get(): this branch
+            # has the warm cache and is the exact call this method replaces, so
+            # the result can never be worse than not running the portfolio.
+            cur, progressed = self._lns_rounds(placements, deadline, base_seed,
+                                               spec_adopted, True)
+
+            hard = deadline + 2.0
+            for ar in asyncs:
+                try:
+                    r = ar.get(timeout=max(0.05, hard - time.time()))
+                    if r is not None:
+                        out.append(r)
+                except Exception:
+                    pass  # this branch is simply absent from the vote
+        finally:
+            if pool is not None:
+                pool.terminate()
+                pool.join()
+
+        # Re-score every branch HERE rather than trusting the value a child
+        # computed: one arithmetic path, and the winner is chosen on it.
+        best_pl, best_o = cur, self._exact_obj(cur)
+        objs = []
+        for rows, _child_obj in out:
+            cand = [Placement(*row) for row in rows]
+            o = self._exact_obj(cand)
+            objs.append(o)
+            if o < best_o - 1e-9:
+                best_pl, best_o, progressed = cand, o, True
+        print(f"[ogc] Portfolio    : local {self._exact_obj(cur):.0f}, children "
+              f"{[f'{o:.0f}' for o in sorted(objs)]} -- best {best_o:.0f}  "
+              f"elapsed={self.elapsed():.2f}s")
+        return best_pl, progressed
+
     # -- parallel per-bay tardiness refinement (uses the idle cores) ----------
     def parallel_bay_refine(self, placements: list[Placement],
                             deadline: float) -> tuple[list[Placement], bool]:
@@ -2101,6 +2221,16 @@ class Solver:
         serial_frac = 1.0 / (len(self.bays) + 1)
         serial_deadline = (time.time() + serial_frac * (lns_end - time.time())
                            if use_par else lns_end)
+        # Whole-solution portfolio.  It REPLACES the serial phase in the same
+        # window rather than taking a share of its own: branch 0 runs exactly
+        # what the serial driver would, so the budget split is untouched and
+        # the extra branches are pure use of cores that were idle.  The only
+        # real cost is standing a branch up (spawn plus a cold geometry cache),
+        # so the window has to be a comfortable multiple of the one measured
+        # quantity that tracks this instance's geometry cost -- the Layer-1
+        # construction.  Unlike the per-bay phase this needs no second bay.
+        use_port = (_l1 is not None and self._n_cores() >= 2
+                    and (serial_deadline - time.time()) > 2.0 * _l1)
 
         spec_adopted = False
         try:
@@ -2158,8 +2288,15 @@ class Solver:
                 # rising-temperature rounds (see _lns_rounds).
                 margin = 0.02 * self.timelimit
                 base_seed = 0x5EED if spec_adopted else 0xC0FFEE
-                cur, progressed = self._lns_rounds(lns_input, serial_deadline,
-                                                   base_seed, spec_adopted, True)
+                if use_port:
+                    # Runs the serial driver in this process and adds child
+                    # branches around it, so it can only match or beat the plain
+                    # serial call in the else-arm.
+                    cur, progressed = self.portfolio_search(
+                        lns_input, serial_deadline, base_seed, spec_adopted)
+                else:
+                    cur, progressed = self._lns_rounds(lns_input, serial_deadline,
+                                                       base_seed, spec_adopted, True)
                 if progressed:
                     best_placements, best_obj = self._try_accept(
                         "Layer2 accept ", cur, best_placements, best_obj)
@@ -2214,6 +2351,42 @@ class Solver:
 # ---------------------------------------------------------------------------
 # Process-pool entry for parallel per-bay refinement
 # ---------------------------------------------------------------------------
+
+def _pipeline_worker(args):
+    """Run ONE independent search branch and return (placement tuples, obj).
+
+    Top-level so it is picklable under spawn (this module has no import-time
+    side effects, so a re-import in the child is free).  Any failure returns
+    None: the branch drops out of the vote and the parent's incumbent, which
+    was never handed to a child, is untouched."""
+    (prob_info, timelimit, t_start, deadline, seed, noise,
+     start_tuples, l1_secs, o23_bound, cache_cap) = args
+    try:
+        solver = Solver(prob_info, timelimit)
+        # Adopt the parent's clock so every deadline inside the branch refers
+        # to the same wall-clock instant it does in the parent.
+        solver.t_start = t_start
+        solver.deadline = t_start + max(1.0, timelimit) * TIME_SAFETY
+        solver._flag_cache_cap = cache_cap
+        # Pass the proven bound down so a branch that reaches it stops early
+        # instead of burning its core on a solved instance.
+        solver._o23_bound = o23_bound
+        if start_tuples is not None:
+            cur = [Placement(*t) for t in start_tuples]
+            solver._l1_secs = l1_secs
+        else:
+            t0 = time.time()
+            cur = solver.build_coexist(
+                deadline=min(deadline, t0 + 2.5 * l1_secs),
+                order_rng=random.Random(seed), order_noise=noise)
+            solver._l1_secs = max(time.time() - t0, 1e-6)
+        cur, _ = solver._lns_rounds(cur, deadline, seed, False, True)
+        return ([(p.block_id, p.bay_id, p.x, p.y, p.orient_idx,
+                  p.entry_time, p.exit_time) for p in cur],
+                solver._exact_obj(cur))
+    except Exception:
+        return None
+
 
 def _bay_lns_worker(args):
     """Refine ONE bay's tardiness and return placement tuples.  Top-level so
