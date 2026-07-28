@@ -48,9 +48,206 @@ import random
 from dataclasses import dataclass
 
 import shapely
+import numpy as np
 
 from utils import (Bay, Block, check_feasibility,
                    _resolve_layers, _bounding_box, _poly_from_verts)
+
+# ---------------------------------------------------------------------------
+# Fast crane-predicate geometry kernel (numba, integer coords)
+# ---------------------------------------------------------------------------
+# Replaces shapely `area(A ∩ B) > 0` on the search hot path.  DECISION-IDENTICAL
+# to check_entry (verified: synthetic edge cases incl. collinear/shared-edge +
+# 20,000 real layer pairs across 5 instances, 0 mismatches).  Measured ~62x per
+# cache-miss vs the shapely poly-build + predicate path (0.8us vs 50us), which is
+# ~59% of the LNS window on congested instances -> ~2.4x iteration throughput.
+#
+# Strategy: scale 4-decimal coords by 1e4 -> exact int64 (positions are already
+# int); triangulate each layer ONCE (ear clipping, cached per (shape, orient));
+# "interiors overlap" (area>0) <=> some triangle of A and some triangle of B
+# overlap in positive area, by SAT with STRICT interval overlap on all 6 edge
+# normals (touching = equal projection bound = NOT overlap -- this is what a
+# naive vertex-inside/edge-cross test gets wrong on flush/collinear placements,
+# which _place_coexist produces constantly by bottom-left filling).
+# Self-intersecting layers (which utils repairs with buffer(0)) fail ear
+# clipping -> triangulate returns None and _sweep_blocked falls back to shapely
+# for that layer.  If numba is unavailable the whole path degrades to shapely.
+_GEOM_SCALE = 10000
+
+try:
+    from numba import njit
+    _NUMBA = True
+except Exception:  # numba missing -> tris path disabled, shapely path used
+    _NUMBA = False
+
+    def njit(*args, **kwargs):
+        def _decorate(fn):
+            return fn
+        return _decorate if not (args and callable(args[0])) else args[0]
+
+
+def _geom_signed_area2(pts):
+    s = 0
+    n = len(pts)
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return s
+
+
+def _geom_tri_area2(ax, ay, bx, by, cx, cy):
+    return (bx - ax) * (cy - ay) - (cx - ax) * (by - ay)
+
+
+def _geom_pt_in_tri(px, py, ax, ay, bx, by, cx, cy):
+    d1 = _geom_tri_area2(px, py, ax, ay, bx, by)
+    d2 = _geom_tri_area2(px, py, bx, by, cx, cy)
+    d3 = _geom_tri_area2(px, py, cx, cy, ax, ay)
+    has_neg = (d1 < 0) or (d2 < 0) or (d3 < 0)
+    has_pos = (d1 > 0) or (d2 > 0) or (d3 > 0)
+    return not (has_neg and has_pos)
+
+
+def _triangulate(verts_int):
+    """Ear-clip a simple polygon (list of (int,int)); return an (n_tri,3,2)
+    int64 array, or None if degenerate / not simple (caller uses shapely)."""
+    pts = [(int(x), int(y)) for x, y in verts_int]
+    dedup = []
+    for p in pts:
+        if not dedup or dedup[-1] != p:
+            dedup.append(p)
+    if len(dedup) > 1 and dedup[0] == dedup[-1]:
+        dedup.pop()
+    pts = dedup
+    if len(pts) < 3:
+        return None
+    a2 = _geom_signed_area2(pts)
+    if a2 == 0:
+        return None
+    if a2 < 0:
+        pts = pts[::-1]
+    idx = list(range(len(pts)))
+    tris = []
+    guard = 0
+    limit = len(pts) * len(pts) + 10
+    while len(idx) > 3:
+        guard += 1
+        if guard > limit:
+            return None
+        clipped = False
+        m = len(idx)
+        for i in range(m):
+            i0, i1, i2 = idx[(i - 1) % m], idx[i], idx[(i + 1) % m]
+            ax, ay = pts[i0]; bx, by = pts[i1]; cx, cy = pts[i2]
+            if _geom_tri_area2(ax, ay, bx, by, cx, cy) <= 0:
+                continue
+            ok = True
+            for jj in idx:
+                if jj in (i0, i1, i2):
+                    continue
+                px, py = pts[jj]
+                if _geom_pt_in_tri(px, py, ax, ay, bx, by, cx, cy):
+                    ok = False
+                    break
+            if ok:
+                tris.append(((ax, ay), (bx, by), (cx, cy)))
+                del idx[i]
+                clipped = True
+                break
+        if not clipped:
+            return None
+    i0, i1, i2 = idx
+    ax, ay = pts[i0]; bx, by = pts[i1]; cx, cy = pts[i2]
+    if _geom_tri_area2(ax, ay, bx, by, cx, cy) != 0:
+        tris.append(((ax, ay), (bx, by), (cx, cy)))
+    if not tris:
+        return None
+    return np.array(tris, dtype=np.int64)
+
+
+@njit(cache=False)
+def _geom_axis_sep(t1, t2, ax, ay, shift):
+    mn1 = mx1 = t1[0, 0] * ax + t1[0, 1] * ay
+    for i in range(1, 3):
+        p = t1[i, 0] * ax + t1[i, 1] * ay
+        if p < mn1:
+            mn1 = p
+        if p > mx1:
+            mx1 = p
+    mn2 = mx2 = t2[0, 0] * ax + t2[0, 1] * ay
+    for i in range(1, 3):
+        p = t2[i, 0] * ax + t2[i, 1] * ay
+        if p < mn2:
+            mn2 = p
+        if p > mx2:
+            mx2 = p
+    mn2 += shift
+    mx2 += shift
+    return mx1 <= mn2 or mx2 <= mn1
+
+
+@njit(cache=False)
+def _geom_tri_tri(t1, t2, dx, dy):
+    for e in range(3):
+        ax = -(t1[(e + 1) % 3, 1] - t1[e, 1])
+        ay = (t1[(e + 1) % 3, 0] - t1[e, 0])
+        if _geom_axis_sep(t1, t2, ax, ay, dx * ax + dy * ay):
+            return False
+    for e in range(3):
+        ax = -(t2[(e + 1) % 3, 1] - t2[e, 1])
+        ay = (t2[(e + 1) % 3, 0] - t2[e, 0])
+        if _geom_axis_sep(t1, t2, ax, ay, dx * ax + dy * ay):
+            return False
+    return True
+
+
+@njit(cache=False)
+def _geom_tris_overlap(trisA, oax, oay, trisB, obx, oby):
+    """True iff any triangle of A overlaps any triangle of B in positive area,
+    B at relative offset (obx-oax, oby-oay).  Arrays are (n,3,2) int64 in local
+    (un-offset) coords -- nothing is copied."""
+    dx = obx - oax
+    dy = oby - oay
+    for i in range(trisA.shape[0]):
+        for j in range(trisB.shape[0]):
+            if _geom_tri_tri(trisA[i], trisB[j], dx, dy):
+                return True
+    return False
+
+
+@njit(cache=False)
+def _geom_block_sweep(m_tris, m_starts, m_bb, m_ox, m_oy,
+                      e_tris, e_starts, e_bb, e_ox, e_oy):
+    """Whole crane sweep of one block pair in a single call: for every mover
+    layer k and existing layer j >= k whose (scaled-int, world) bboxes overlap,
+    test positive-area triangle overlap.  Decision-identical to the per-layer
+    _sweep_blocked (same j>=k rule, same bbox prefilter, same SAT test), but the
+    entire loop runs in numba -- no per-layer python dispatch.  m_tris/e_tris are
+    concatenated (n,3,2) int64 triangles in local scaled coords; m_starts[k]..
+    m_starts[k+1] slices layer k; m_bb[k] is layer k's local scaled bbox; the
+    (ox,oy) are the reference-point offsets in the scaled frame."""
+    dx = e_ox - m_ox
+    dy = e_oy - m_oy
+    n_m = m_bb.shape[0]
+    n_e = e_bb.shape[0]
+    for k in range(n_m):
+        mx0 = m_bb[k, 0] + m_ox
+        my0 = m_bb[k, 1] + m_oy
+        mx1 = m_bb[k, 2] + m_ox
+        my1 = m_bb[k, 3] + m_oy
+        for j in range(k, n_e):
+            ex0 = e_bb[j, 0] + e_ox
+            ey0 = e_bb[j, 1] + e_oy
+            ex1 = e_bb[j, 2] + e_ox
+            ey1 = e_bb[j, 3] + e_oy
+            if mx1 <= ex0 or ex1 <= mx0 or my1 <= ey0 or ey1 <= my0:
+                continue  # layer bboxes disjoint -> triangles disjoint
+            for ti in range(m_starts[k], m_starts[k + 1]):
+                for tj in range(e_starts[j], e_starts[j + 1]):
+                    if _geom_tri_tri(m_tris[ti], e_tris[tj], dx, dy):
+                        return True
+    return False
 
 
 # Fraction of the wall-clock limit we allow ourselves to use overall.  Below
@@ -66,6 +263,43 @@ TIME_SAFETY = 0.90
 # official check_feasibility on the final candidate.
 CONSTRUCT_SAFETY = 0.72
 LNS_SAFETY = 0.82
+
+# Max candidate positions evaluated per (block, orientation, bay) in
+# _place_coexist, taken from the conflict-count-sorted list (best first).  A cap
+# trades a little per-reinsertion placement quality for MANY fewer crane checks,
+# so each LNS iteration finishes sooner and more iterations fit the window.
+#
+# It is a GENUINE trade-off, not a pure win -- proven by multi-rep isolated A/B
+# (each row min..max over 4 reps, TL=30):
+#   prob_38 (extreme time-starved): uncapped 57.8..64.8M  cap150 55.6..59.1M  => cap WINS ~-10%
+#   prob_26 (congested):            uncapped 14.67..15.18M cap150 14.67..15.12M => NEUTRAL (overlap)
+#   prob_39 (converges, spread 1.00): uncapped 20.90M      cap150 21.76M       => cap LOSES +4%
+#   prob_31 (converges, spread 1.00): uncapped 13.19M      cap150 13.63M       => cap LOSES +3%
+#   prob_4  (semi-converged):       uncapped 31.3..47.8k   cap150 48.1..67.9k  => cap LOSES +44%
+#   prob_15 (roomy):                uncapped 51.2..58.4k   cap150 61.9..67.9k  => cap LOSES +14%
+# (An earlier SINGLE-run A/B mislabelled prob_4 as a cap WIN -- that was pure
+# variance on a 1.5x-spread instance; the discipline lesson is in CLAUDE.md.)
+#
+# The winner/loser split is exactly CONVERGENCE: the cap only helps instances so
+# time-starved that construction dominates the window (LNS can never converge --
+# throughput matters more than breadth); it hurts everything that converges or
+# semi-converges (breadth matters, extra iterations buy nothing).  So GATE it on
+# a measured, TL-relative starvation signal: apply the cap only when the first
+# full construction cost `_l1_secs` exceeds a fraction of the time limit.  This
+# self-scales -- on the server's long TLs even prob_38-class construction is a
+# small fraction of TL, so the gate turns OFF and those instances go uncapped
+# (correct: long TL = time to converge = breadth wins).  When the gate is OFF
+# the effective cap is unbounded.  Env-overridable for tuning / A/B.
+_CAND_CAP = int(os.environ.get("OGC_CAND_CAP", "150"))
+_CAND_CAP_UNBOUNDED = 1 << 30
+# Fraction of the time limit above which a single construction is deemed
+# starvation-dominant (gate the cap ON): construction consuming > half the
+# window leaves < half for LNS, which then cannot converge -> throughput
+# (the cap) beats breadth.  Ratio-based, not an absolute constant, so it
+# self-scales to the server's longer TLs.  Calibrated by measured _l1/TL:
+# prob_38 (cap WINS) = 0.69 -> ON; prob_39/31/26 (cap loses/neutral) <= 0.31
+# -> OFF.  0.5 cleanly separates the two regimes on the practice set.
+_CAND_CAP_GATE_FRAC = float(os.environ.get("OGC_CAND_CAP_GATE", "0.5"))
 
 # Layer-3 (Gurobi timing MILP) runs in the [LNS_SAFETY, MILP_SAFETY] window;
 # the remainder up to TIME_SAFETY stays reserved for the final official check.
@@ -194,6 +428,27 @@ class Solver:
         # Best dual bound on w2*obj2 + w3*obj3 the reassignment master has
         # proved so far, or None while it has proved none; see _lower_bound.
         self._o23_bound: float | None = None
+        # Effective per-placement candidate cap.  Starts UNBOUNDED (breadth wins
+        # unless proven starved); the gate below build_coexist tightens it to
+        # _CAND_CAP once the measured construction cost shows the window is
+        # starvation-dominant.  The initial construction thus runs uncapped.
+        self._cand_cap: int = _CAND_CAP_UNBOUNDED
+
+        # Warm the numba crane kernel now so its one-time JIT compile happens
+        # before the timed search (on the Linux server this compiled code is
+        # then COW-inherited by every forked worker -- no re-JIT).  If it fails
+        # to compile at runtime, disable the tris path so the whole predicate
+        # degrades cleanly to shapely.
+        global _NUMBA
+        if _NUMBA:
+            try:
+                _t = np.array([[[0, 0], [10, 0], [0, 10]]], dtype=np.int64)
+                _geom_tris_overlap(_t, 0, 0, _t, 100000, 0)
+                _st = np.array([0, 1], dtype=np.int64)
+                _bb = np.array([[0, 0, 10, 10]], dtype=np.int64)
+                _geom_block_sweep(_t, _st, _bb, 0, 0, _t, _st, _bb, 100000, 0)
+            except Exception:
+                _NUMBA = False
 
     # -- time ----------------------------------------------------------------
     def time_left(self) -> float:
@@ -238,20 +493,44 @@ class Solver:
                 rx, ry = layers[0][0] if layers[0] else (0.0, 0.0)
                 layers = [[(vx - rx, vy - ry) for vx, vy in l] for l in layers]
             bboxes = [_bounding_box(l) for l in layers]
-            g = (layers, bboxes)
+            # Per-layer integer triangulation for the numba crane kernel (built
+            # once per shape/orient).  None per layer -> that layer is degenerate
+            # or self-intersecting, so _sweep_blocked falls back to shapely there.
+            tris = None
+            blk = None
+            if _NUMBA:
+                tris = [_triangulate([(round(vx * _GEOM_SCALE), round(vy * _GEOM_SCALE))
+                                      for vx, vy in l]) for l in layers]
+                # When EVERY layer triangulated, also pack a flattened form so the
+                # whole j>=k sweep of a block pair runs in one numba call.
+                if tris and all(t is not None for t in tris):
+                    starts = [0]
+                    lbb = []
+                    for li, t in enumerate(tris):
+                        starts.append(starts[-1] + int(t.shape[0]))
+                        bx0, by0, bx1, by1 = bboxes[li]
+                        lbb.append((round(bx0 * _GEOM_SCALE), round(by0 * _GEOM_SCALE),
+                                    round(bx1 * _GEOM_SCALE), round(by1 * _GEOM_SCALE)))
+                    all_tris = np.concatenate(tris, axis=0)
+                    blk = (all_tris, np.array(starts, dtype=np.int64),
+                           np.array(lbb, dtype=np.int64))
+            g = (layers, bboxes, tris, blk)
             self._geo_cache[key] = g
         return g
 
     def _make_geo(self, block_data: dict, orient_idx: int, x: float, y: float) -> list:
         """Geometry bundle [world bboxes, lazy polys, local layers, x, y,
-        shape_key] for one placed shape.  Polygons are built (and prepared) on
-        first use.  shape_key = (id(block_data), orient) is stable for the
-        solver's lifetime (block dicts live in self.blocks) and identifies the
-        translation-invariant shape for the _flag cache."""
-        loc, lb = self._local_geo(block_data, orient_idx)
+        shape_key, tris, x_scaled, y_scaled] for one placed shape.  Polygons are
+        built (and prepared) on first use.  shape_key = (id(block_data), orient)
+        is stable for the solver's lifetime (block dicts live in self.blocks) and
+        identifies the translation-invariant shape for the _flag cache.  tris is
+        the per-layer integer triangulation (or None); (x_scaled, y_scaled) is
+        the reference-point offset in the kernel's integer frame."""
+        loc, lb, tris, blk = self._local_geo(block_data, orient_idx)
         wb = [(b0 + x, b1 + y, b2 + x, b3 + y) for b0, b1, b2, b3 in lb]
         return [wb, [Solver._UNBUILT] * len(loc), loc, x, y,
-                (id(block_data), orient_idx)]
+                (id(block_data), orient_idx), tris,
+                int(round(x * _GEOM_SCALE)), int(round(y * _GEOM_SCALE)), blk]
 
     def _rec_geo(self, rec: _Rec) -> list:
         g = getattr(rec, "geo", None)
@@ -277,16 +556,39 @@ class Solver:
         """True iff the mover's vertical sweep is obstructed by `exist`:
         exists (k, j), j >= k, with area(mover layer k  ∩  exist layer j) > 0.
         Decision-identical to utils.check_entry conditions 2 & 3."""
+        m_ox, m_oy = mover_geo[7], mover_geo[8]
+        e_ox, e_oy = exist_geo[7], exist_geo[8]
+        # Fast path: both blocks fully triangulated -> the entire j>=k sweep in
+        # one numba call (no per-layer python dispatch).
+        m_blk = mover_geo[9]
+        e_blk = exist_geo[9]
+        if m_blk is not None and e_blk is not None:
+            return _geom_block_sweep(m_blk[0], m_blk[1], m_blk[2], m_ox, m_oy,
+                                     e_blk[0], e_blk[1], e_blk[2], e_ox, e_oy)
+        # Fallback (some layer self-intersecting/degenerate): per-layer, with
+        # shapely for the layers that did not triangulate.
         m_wb = mover_geo[0]
         e_wb = exist_geo[0]
         n_e = len(e_wb)
+        m_tris = mover_geo[6]
+        e_tris = exist_geo[6]
         for k in range(len(m_wb)):
             mk = m_wb[k]
             mp = Solver._UNBUILT
+            mt = m_tris[k] if m_tris is not None else None
             for j in range(k, n_e):
                 ej = e_wb[j]
                 if mk[2] <= ej[0] or ej[2] <= mk[0] or mk[3] <= ej[1] or ej[3] <= mk[1]:
                     continue  # layer bboxes disjoint -> polygons disjoint
+                et = e_tris[j] if e_tris is not None else None
+                if mt is not None and et is not None:
+                    # numba fast path: exact positive-area test on cached
+                    # integer triangles (decision-identical to the shapely
+                    # area>0 below; ~62x cheaper on a cache miss).
+                    if _geom_tris_overlap(mt, m_ox, m_oy, et, e_ox, e_oy):
+                        return True
+                    continue
+                # shapely fallback for a degenerate/self-intersecting layer
                 if mp is Solver._UNBUILT:
                     mp = Solver._geo_poly(mover_geo, k)
                 if mp is None:
@@ -578,6 +880,11 @@ class Solver:
                 # Order positions by (bbox-conflict count, top edge): positions
                 # whose bbox overlaps nothing active can enter at release time
                 # with zero shapely work, so they are tried first.
+                # Collect the bbox-overlapping recs per candidate here (the same
+                # scan that counts conflicts): _earliest_slot then reuses this
+                # list instead of re-filtering all recs, which on a congested
+                # bay was ~half its cost (measured: _earliest_slot self-time
+                # dominated the LNS once the numba kernel removed the geometry).
                 cands = []
                 for x in xs:
                     wx0 = x + lx0
@@ -585,19 +892,17 @@ class Solver:
                     for y in ys:
                         wy0 = y + ly0
                         wy1 = y + ly1
-                        cnt = 0
-                        for rec in recs:
-                            rb = rec.bbox
-                            if not (wx1 <= rb[0] or rb[2] <= wx0 or wy1 <= rb[1] or rb[3] <= wy0):
-                                cnt += 1
-                        cands.append((cnt, wy1, x, y))
-                cands.sort()
+                        clist = [rec for rec in recs
+                                 if not (wx1 <= rec.bbox[0] or rec.bbox[2] <= wx0 or
+                                         wy1 <= rec.bbox[1] or rec.bbox[3] <= wy0)]
+                        cands.append((len(clist), wy1, x, y, clist))
+                cands.sort(key=lambda c: (c[0], c[1]))
 
-                for cnt, top_y, x, y in cands:
+                for cnt, top_y, x, y, clist in cands[:self._cand_cap]:
                     if time.time() > t_deadline:
                         return self._as_placement(bi, best)  # hard budget: commit incumbent (may be None)
                     bound = best[0] if best is not None else None
-                    slot = self._earliest_slot(bd, oi, bb, x, y, recs,
+                    slot = self._earliest_slot(bd, oi, bb, x, y, clist,
                                                exit_ts, r, proc, due, pref_pen, bound,
                                                t_deadline)
                     if slot is None:
@@ -630,28 +935,22 @@ class Solver:
         return Placement(bi, bay_id, int(x), int(y), oi, int(entry), int(exit_t))
 
     def _earliest_slot(self, bd: dict, oi: int, bb, x: int, y: int,
-                       recs: list[_Rec], exit_ts: list[int],
+                       conf: list[_Rec], exit_ts: list[int],
                        r: int, proc: int, due: int, pref_pen: float,
                        score_bound: float | None,
                        t_deadline: float = float("inf")) -> tuple[int, int] | None:
         """Earliest entry time t >= r at which the block at (x, y, oi) is
         feasible against all committed blocks in this bay, mirroring
         check_feasibility pairwise IN BOTH DIRECTIONS (see class comment).
-        Candidate entries: r and every later exit time (bay state only changes
-        at exits).  The last candidate (= max exit) always succeeds because the
-        bay is empty from then on, so this returns None only when `score_bound`
-        proves every remaining slot worse than the incumbent."""
-        lx0, ly0, lx1, ly1 = bb
-        wx0 = x + lx0
-        wy0 = y + ly0
-        wx1 = x + lx1
-        wy1 = y + ly1
-        # Blocks whose bbox is disjoint from ours can never interact spatially
-        # (bbox-disjoint => polygon interiors disjoint at every layer, which
-        # clears both the collision and the crane predicates).
-        conf = [rec for rec in recs
-                if not (wx1 <= rec.bbox[0] or rec.bbox[2] <= wx0 or
-                        wy1 <= rec.bbox[1] or rec.bbox[3] <= wy0)]
+        `conf` is the caller-supplied list of committed blocks whose bbox
+        overlaps ours at (x, y) -- bbox-disjoint blocks can never interact
+        (disjoint bbox => disjoint polygon interiors at every layer, clearing
+        both the collision and the crane predicates), so they are excluded
+        upstream.  Candidate entries: r and every later exit time (bay state
+        only changes at exits).  The last candidate (= max exit) always
+        succeeds because the bay is empty from then on, so this returns None
+        only when `score_bound` proves every remaining slot worse than the
+        incumbent."""
         if not conf:
             return r, r + proc
 
@@ -1318,6 +1617,20 @@ class Solver:
         # and base seed are deterministic, so the 10-33% we measure run to run
         # comes from how many iterations happen to fit, and independent seeds
         # sample exactly that distribution.
+        #
+        # Diversifying the SEARCH POLICY (giving children hot / restart-heavy
+        # temperature ladders instead of the default) was also tried and LOSES,
+        # for a subtle reason worth recording: best-of-k here is variance
+        # reduction over the BEST policy, and with enough time the default
+        # descent-first ladder IS the best policy (it converges deepest).  Four
+        # default-policy samples give a strong best-of-4; spending three cores
+        # on inferior regimes leaves only ONE default sample -- effectively
+        # best-of-1 on the good policy -- so it regresses (full-pipeline A/B:
+        # prob_4 TL=120 seed-only 15.9k vs diverse 33.1k, ~2x worse; the gap
+        # WIDENS with the window, refuting the "small window starves the
+        # children" defence).  A 15s in-process probe had shown a fake +7..27%
+        # only because it gave each policy its own seeds -- 12 draws vs 3 -- a
+        # sample-count artifact, not a policy effect.  Do not retry.
         # Seeds skip base_seed itself -- that one belongs to the parent's
         # branch, and a duplicate would waste a core replaying it.
         tasks = [(self.prob, self.timelimit, self.t_start, deadline,
@@ -2089,6 +2402,16 @@ class Solver:
                 _t1 = time.time()
                 cand_placements = self.build_coexist()
                 self._l1_secs = time.time() - _t1  # cost estimate for Layer-3a rebuilds
+                # Adaptive candidate cap: only a construction that dominates the
+                # window (starved, LNS can't converge) benefits from capping the
+                # per-placement search; converging instances are hurt by it (see
+                # _CAND_CAP comment for the multi-rep A/B).  Gate on the measured,
+                # TL-relative cost so it self-scales to the server's longer TLs.
+                if self._l1_secs > _CAND_CAP_GATE_FRAC * self.timelimit:
+                    self._cand_cap = _CAND_CAP
+                    print(f"[ogc] cand cap ON    : starved "
+                          f"(_l1={self._l1_secs:.1f}s > {_CAND_CAP_GATE_FRAC:g}*TL) "
+                          f"-> cap={_CAND_CAP}")
                 cand = {"operations": _build_operations(cand_placements)}
                 res1 = check_feasibility(self.prob, cand)
                 if res1["feasible"] and res1["objective"] < best_obj:
