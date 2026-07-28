@@ -6,7 +6,7 @@ The Grand Shipyard Puzzle (LG CNS Optimization Grand Challenge 2026) 참가 솔�
 제약은 배정·시간·공간(레이어 겹침 금지)·**크레인(수직 이동 오버행 규칙)** 네 가지이며,
 채점은 `utils.check_feasibility` 로 검증한 뒤 목적값으로 팀 간 순위를 매긴다.
 
-## 핵심 접근
+## 접근
 
 베이스라인 프로파일링에서 실패의 **97%가 크레인 통로 접근**(공간 충돌은 0%)임을 확인하고,
 "면적이 아니라 **크레인 코엑시스턴스**가 병목"이라는 진단 위에 **feasibility를 절대 보장하는
@@ -99,27 +99,12 @@ ogc2026/
 ├── baseline/
 │   ├── myalgorithm.py        # 엔트리 + 전 로직(Solver 클래스 + Placement) — 단일 파일 제출본
 │   ├── baseline_greedy.py    # 참조 구현 · 헬퍼 출처
-│   └── utils.py              # 공식 채점기(check_feasibility) — 수정 금지, 임포트만
+│   └── utils.py              # 공식 채점기(check_feasibility)
 ├── alg_tester/
 │   ├── alg_tester_app.py     # PyQt6 GUI 테스터 · 시각화
 │   └── ogc2026_env.yml       # conda 환경 파일
-├── 연습문제 1/train/         # 학습 인스턴스 prob_1..20
-├── 연습문제 2/train/         # 학습 인스턴스 prob_21..40
-├── report/                   # 기술 리포트
-├── 문제 정의.pdf             # 공식 문제 정의(v1.2)
-├── CLAUDE.md                 # 작업 지침서 · 진행 로그
-└── README.md
 ```
 
-## 설계 원칙 · 개발 규율
-
-- **feasibility 최우선** — 리더보드는 infeasible/시간초과/크래시를 모두 −1로 매긴다.
-  항상 "보장된 feasible 해"를 들고 가고, 최종 반환 해는 반드시 공식 채점기로 통과 확인한다.
-- **단일 파일 방침** — 우리 로직은 전부 `myalgorithm.py` 안에 둔다(`Solver` + `Placement`).
-- **측정 우선(measurement discipline)** — 인스턴스별 run 분산이 커서(일부 3배 이상) 단일 실행으로
-  ±% 변화를 판정하지 않는다. 성능 판정은 **격리 A/B 다회 반복**으로만, 40개 순차 벤치는
-  feasibility·시간 규율 게이트로만 쓴다.
-- **오버피팅 금지** — 파라미터는 연습 40개의 우연한 분포가 아니라 인스턴스 특성으로 스케일링한다.
 
 ## 서버 / 환경 제약
 
